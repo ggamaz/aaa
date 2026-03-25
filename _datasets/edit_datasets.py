@@ -143,7 +143,6 @@ class CaptionDataset(Dataset):
         elif self.image_process == 'dynamic':   # dynamic and make sure the largest edge <= self.image_size
             image = resize_image_dynamic(x=image, image_size=self.image_size, unit_image_size=self.unit_image_size)
         elif self.image_process == 'fix_pixels': # fix pixels contain radio of image
-            # import pdb; pdb.set_trace()
             image = resize_image_fix_pixels(x=image, image_size=self.image_size, unit_image_size=self.unit_image_size)
         elif self.image_process == 'resize2square':
             image = image.resize(size=(self.image_size, self.image_size))
@@ -341,6 +340,52 @@ class MultiImageEditDataset(CaptionDataset):
             print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
             return self._retry()
 
+class MultiImageMultiPromptDataset(MultiImageEditDataset):
+    def __getitem__(self, idx):
+        if self.debug:
+            idx = 0
+        try:
+            data_sample = self.data_list[idx]
+            if self.image_folder is not None:
+                source_images = []
+                for img_path in data_sample['input_image']:
+                    img = Image.open(os.path.join(self.image_folder, img_path)).convert('RGB')
+                    source_images.append(img)
+                target_image = Image.open(os.path.join(self.image_folder, data_sample['output_image'])).convert('RGB')
+            else:
+                source_images =[]
+                for img_path in data_sample['input_image']:
+                    img = Image.open(img_path).convert('RGB')
+                    source_images.append(img)
+                target_image = Image.open(data_sample['output_image']).convert('RGB')
+
+            # prompt = data_sample['instruction']
+            prompt_visual = data_sample.get('instruction', 'fuse for visual quality')
+            prompt_downstream = data_sample.get('instruction_downstream', 'fuse for downstream detection task')
+
+            pixel_values_src = []
+            for img in source_images:
+                pixel_values_src.append(self._process_image(img))
+            pixel_values = self._process_image(target_image)
+
+            # # 处理两种 Text
+            # data_visual = self._process_text(prompt_visual) if self.tokenizer is not None else dict()
+            # data_downstream = self._process_text(prompt_downstream) if self.tokenizer is not None else dict()
+            
+            return dict(
+                pixel_values_src=pixel_values_src,
+                pixel_values=pixel_values,
+                image_dir=self.image_folder,
+                
+                text=prompt_visual, # 视觉任务所需
+                # input_ids=data_visual.get('input_ids', None),
+                text_downstream=prompt_downstream,# 下游任务所需
+                # input_ids_downstream=data_downstream.get('input_ids', None),
+            )
+        except Exception as e:
+            print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
+            return self._retry()
+
 
 class ReconstructDataset(CaptionDataset):
     def _process_image(self, image):
@@ -368,99 +413,3 @@ class ReconstructDataset(CaptionDataset):
         except Exception as e:
             print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
             return self._retry()
-
-
-if __name__ == "__main__":
-    import traceback
-    from transformers import AutoTokenizer
-
-    QWEN_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
-    PROMPT_TEMPLATE = dict(
-        IMG_START_TOKEN='<|vision_start|>',
-        IMG_END_TOKEN='<|vision_end|>',
-        IMG_CONTEXT_TOKEN='<|image_pad|>',
-        IMG_START_TOKEN_FOR_GENERATION=False,
-        SYSTEM='<|im_start|>system\n{system}<|im_end|>\n',
-        INSTRUCTION='<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n',
-        SUFFIX='<|im_end|>',
-        SUFFIX_AS_EOS=True,
-        SEP='\n',
-        STOP_WORDS=['<|im_end|>', '<|endoftext|>'],
-        GENERATION='Generate an image: {input}',
-        CFG='Generate an image.',
-    )
-
-    # ── 修改这两个路径 ────────────────────────────────────────────────
-    DATA_PATH    = "/path/to/demo.json"
-    IMAGE_FOLDER = "/path/to/images"       # 若路径已在 json 里写绝对路径则设 None
-    # ─────────────────────────────────────────────────────────────────
-
-    print("=" * 60)
-    print("Step 1: 加载 tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(
-        QWEN_PATH, trust_remote_code=True, padding_side='left')
-    print(f"  vocab size: {tokenizer.vocab_size}")
-
-    print("\nStep 2: 查看 JSON 原始第一条，确认字段名")
-    import json
-    with open(DATA_PATH) as f:
-        raw = json.load(f)
-    print(f"  共 {len(raw)} 条样本")
-    print(f"  第一条字段: {list(raw[0].keys())}")
-    print(f"  第一条内容: {raw[0]}")
-
-    print("\nStep 3: 构建 MultiImageEditDataset")
-    dataset = MultiImageEditDataset(
-        data_path=DATA_PATH,
-        image_folder=IMAGE_FOLDER,
-        tokenizer=tokenizer,
-        prompt_template=PROMPT_TEMPLATE,
-        image_size=512,
-        image_length=256,
-        image_process='dynamic',
-        unit_image_size=32,
-        max_length=1024,
-    )
-    print(f"  dataset size: {len(dataset)}")
-
-    print("\nStep 4: 逐条取前 3 条，打印详情")
-    for i in range(min(3, len(dataset))):
-        print(f"\n  --- sample {i} ---")
-        try:
-            sample = dataset._get_item(i)      # 直接调，不走 retry，报错立即可见
-            print(f"  keys            : {list(sample.keys())}")
-            print(f"  text            : {sample['text'][:80]}")
-            print(f"  pixel_values    : {sample['pixel_values'].shape}  "
-                  f"range [{sample['pixel_values'].min():.2f}, {sample['pixel_values'].max():.2f}]")
-            print(f"  pixel_values_src: {len(sample['pixel_values_src'])} refs")
-            for j, src in enumerate(sample['pixel_values_src']):
-                print(f"    ref[{j}]: {src.shape}  range [{src.min():.2f}, {src.max():.2f}]")
-            if 'input_ids' in sample:
-                print(f"  input_ids       : {sample['input_ids'].shape}")
-                print(f"  decoded prompt  : {tokenizer.decode(sample['input_ids'][:60])}...")
-        except Exception:
-            print(f"  [ERROR] sample {i} 报错如下：")
-            traceback.print_exc()
-
-    print("\nStep 5: 测试 DataLoader collate")
-    from torch.utils.data import DataLoader
-
-    def collate_fn(batch):
-        return dict(
-            pixel_values_src=[b['pixel_values_src'] for b in batch],
-            pixel_values    =[b['pixel_values']      for b in batch],
-            texts           =[b['text']              for b in batch],
-        )
-
-    loader = DataLoader(dataset, batch_size=2, shuffle=False,
-                        num_workers=0, collate_fn=collate_fn)
-    try:
-        batch = next(iter(loader))
-        print(f"  batch keys           : {list(batch.keys())}")
-        print(f"  batch texts          : {[t[:40] for t in batch['texts']]}")
-        print(f"  batch pixel_values[0]: {batch['pixel_values'][0].shape}")
-        print(f"  batch pixel_values_src[0] refs: {len(batch['pixel_values_src'][0])}")
-        print("\n[PASS] DataLoader 正常")
-    except Exception:
-        print("[FAIL] DataLoader 报错：")
-        traceback.print_exc()

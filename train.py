@@ -1,7 +1,8 @@
-# train.py
 import os
-import math
 import argparse
+
+from copy import deepcopy
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -10,12 +11,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.optimization import get_scheduler
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer
+
 from qwen2_5_sd3.transformer_sd3_dynamic import SD3Transformer2DModel
 from qwen2_5_sd3.qwen2_5_vl_sd3_hf_dynamic_fusion import Qwen2p5VLStableDiffusion3HF, guess_load_checkpoint, print_log
-from _datasets.edit_datasets import MultiImageEditDataset
+from _datasets.edit_datasets import MultiImageEditDataset, MultiImageMultiPromptDataset
 from tqdm import tqdm
-SD3_PATH  = "/root/autodl-tmp/UniPic2-SD3.5M-Kontext-2B"
-QWEN_PATH = "/root/autodl-tmp/Qwen2.5-VL-3B-Instruct"
+
+from log_helper import log_training_images_threeline as log_training_images
+from log_helper import print_log
+
+SD3_PATH  = "pretrain_ckpts/UniPic2-SD3.5M-Kontext-2B"
+QWEN_PATH = "pretrain_ckpts/Qwen2.5-VL-3B-Instruct"
 
 PROMPT_TEMPLATE = dict(
     IMG_START_TOKEN='<|vision_start|>',
@@ -40,36 +46,38 @@ CONNECTOR_CFG = dict(
     num_attention_heads=32,
 )
 
-
 def parse_args():
     parser = argparse.ArgumentParser()
     # data
-    parser.add_argument('--data_path',       type=str, default="/root/deepgen_lite/demo_dataset")
-    parser.add_argument('--image_folder',    type=str, default="demo_dataset")
+    parser.add_argument('--data_path',       type=str, default="/root/aaa/COCO/images")
+    parser.add_argument('--image_folder',    type=str, default="")
     parser.add_argument('--image_size',      type=int, default=512)
     parser.add_argument('--image_length',    type=int, default=256)
-    parser.add_argument('--image_process',   type=str, default='fix_pixels',
+    parser.add_argument('--image_process',   type=str, default='dynamic',
                         choices=['dynamic', 'fix_pixels', 'resize2square'])
-    # training
-    parser.add_argument('--output_dir',      type=str, default='./output')
-    parser.add_argument('--resume',          type=str, default=None)
-    parser.add_argument('--num_epochs',      type=int, default=10)
+    
+    parser.add_argument('--output_dir',      type=str, default='./runs/output')
+    parser.add_argument('--resume',          type=str, default="/root/autodl-tmp/model.pt")
+    parser.add_argument('--max_steps',       type=int, default=10000, help="Total number of training steps")
     parser.add_argument('--batch_size',      type=int, default=1)
-    parser.add_argument('--grad_accum',      type=int, default=4)
+    parser.add_argument('--grad_accum',      type=int, default=8)
     parser.add_argument('--lr',              type=float, default=1e-4)
     parser.add_argument('--lr_scheduler',    type=str, default='cosine')
-    parser.add_argument('--warmup_steps',    type=int, default=500)
+    parser.add_argument('--warmup_steps',    type=int, default=100)
     parser.add_argument('--max_grad_norm',   type=float, default=1.0)
     parser.add_argument('--save_every',      type=int, default=1000)
     parser.add_argument('--log_every',       type=int, default=1)
+    parser.add_argument('--log_image_every', type=int, default=10, help="Log generated images every N steps")
     parser.add_argument('--num_workers',     type=int, default=4)
     parser.add_argument('--seed',            type=int, default=42)
+    
     # model
     parser.add_argument('--num_queries',     type=int, default=128)
     parser.add_argument('--max_length',      type=int, default=1024)
     parser.add_argument('--freeze_lmm',      action='store_true', default=True)
     parser.add_argument('--freeze_transformer', action='store_true', default=True)
     parser.add_argument('--use_activation_checkpointing', action='store_true', default=False)
+    
     # distributed
     parser.add_argument('--local_rank',      type=int, default=-1)
     return parser.parse_args()
@@ -78,18 +86,15 @@ def parse_args():
 # ── Collate ───────────────────────────────────────────────────────────
 
 def collate_fn(batch):
-    """
-    TwoImageEditDataset returns per-sample dicts with:
-      pixel_values_src : list of tensors  (variable number of refs)
-      pixel_values     : tensor  (C H W)
-      text             : str
-    We keep them as lists so the model can handle variable sizes.
-    """
-    return dict(
+    collated = dict(
         pixel_values_src=[b['pixel_values_src'] for b in batch],  # list[list[Tensor]]
-        pixel_values    =[b['pixel_values']      for b in batch],  # list[Tensor]
-        texts           =[b['text']              for b in batch],  # list[str]
+        pixel_values    =[b['pixel_values']      for b in batch], # list[Tensor]
+        texts           =[b['text']              for b in batch], # list[str]
     )
+    # 如果 dataset 返回了下游任务 prompt，一并打包
+    if 'text_downstream' in batch[0]:
+        collated['texts_downstream'] = [b['text_downstream'] for b in batch]
+    return collated
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────
@@ -109,7 +114,7 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    # ── Distributed setup ─────────────────────────────────────────────
+    # Distributed setup
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     is_ddp     = 'LOCAL_RANK' in os.environ
     if is_ddp:
@@ -118,14 +123,11 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── Tokenizer (needed for dataset + model) ────────────────────────
     print_log("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        QWEN_PATH, trust_remote_code=True, padding_side='left')
+    tokenizer = AutoTokenizer.from_pretrained(QWEN_PATH, trust_remote_code=True, padding_side='left')
 
-    # ── Dataset & DataLoader ──────────────────────────────────────────
     print_log("Building dataset...")
-    dataset = MultiImageEditDataset(
+    dataset = MultiImageMultiPromptDataset(
         data_path=args.data_path,
         image_folder=args.image_folder,
         tokenizer=tokenizer,
@@ -147,7 +149,6 @@ def main():
         pin_memory=True,
     )
 
-    # ── Model components ──────────────────────────────────────────────
     print_log("Loading LMM...")
     lmm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         QWEN_PATH, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
@@ -157,18 +158,18 @@ def main():
         SD3_PATH, subfolder="transformer", torch_dtype=torch.bfloat16)
 
     print_log("Loading scheduler...")
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        SD3_PATH, subfolder="scheduler")
-
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(SD3_PATH, subfolder="scheduler")
+    # 【新增】深拷贝出一个独立的测试用 scheduler，防止 generate 污染训练状态
+    test_scheduler = deepcopy(scheduler)
+    
     print_log("Loading VAE...")
-    vae = AutoencoderKL.from_pretrained(
-        SD3_PATH, subfolder="vae", torch_dtype=torch.bfloat16)
+    vae = AutoencoderKL.from_pretrained(SD3_PATH, subfolder="vae", torch_dtype=torch.bfloat16)
 
     print_log("Building model...")
     model = Qwen2p5VLStableDiffusion3HF(
         transformer=transformer,
-        train_scheduler=scheduler,
-        test_scheduler=scheduler,
+        train_scheduler=scheduler,         # 训练用原来的
+        test_scheduler=test_scheduler,     # <--- 测试用深拷贝出来的
         vae=vae,
         lmm=lmm,
         tokenizer=tokenizer,
@@ -191,62 +192,155 @@ def main():
 
     raw_model = model.module if is_ddp else model
 
-    # ── Optimizer & LR scheduler ──────────────────────────────────────
     trainable = [p for p in model.parameters() if p.requires_grad]
     print_log(f"Trainable parameters: {sum(p.numel() for p in trainable) / 1e6:.1f}M")
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-2)
 
-    total_steps = math.ceil(len(dataset) / (args.batch_size * max(1, dist.get_world_size() if is_ddp else 1))) \
-                  * args.num_epochs // args.grad_accum
-
+    # 按照实际更新步数计算总 scheduler steps
+    total_steps = args.max_steps
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.warmup_steps,
         num_training_steps=total_steps,
     )
-
-    # ── Training loop ─────────────────────────────────────────────────
+    
+    # 【新增】初始化 TensorBoard (仅在主卡创建)
+    writer = None
+    if is_primary():
+        tb_dir = os.path.join(args.output_dir, "logs")
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+        print_log(f"TensorBoard logs will be saved to: {tb_dir}")
+    
+    # ── Training loop (Step based) ────────────────────────────────────
     global_step = 0
+    inner_step = 0
     optimizer.zero_grad()
+    
+    loader_iter = iter(loader)
+    epoch_counter = 0
 
-    for epoch in tqdm(range(args.num_epochs)):
-        if is_ddp:
-            sampler.set_epoch(epoch)
-        model.train()
+    # 【新增】Checkpoint 清理与 Best Loss 追踪变量
+    best_loss = float('inf')
+    last_saved_ckpt = None  # 记录上一次保存的最新模型路径
+    best_saved_ckpt = None  # 记录当前最好的模型路径
+    running_loss_sum = 0.0  # 累计 Loss
+    running_steps = 0       # 累计步数
 
-        for step, batch in enumerate(loader):
+    # =================================================================
+    # 新增逻辑：在正式训练前，先记录一次 Step 0 的生图状态
+    # 为了防止 DDP 卡死，让所有卡都 next 一次数据，但只在主卡生图
+    if is_primary():
+        print_log("Logging initial image before training starts (step 0)...")
+    try:
+        first_batch = next(iter(loader))  # 单独创建一个 iter 不影响后续训练状态
+        if is_primary():
+            log_training_images(raw_model, first_batch, 0, args.output_dir, image_size=args.image_size)
+    except Exception as e:
+        if is_primary():
+            print_log(f"Failed to log initial image: {e}")
+    # =================================================================
+
+    model.train()
+    
+    with tqdm(total=args.max_steps, disable=not is_primary()) as pbar:
+        while global_step < args.max_steps:
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                epoch_counter += 1
+                if is_ddp:
+                    sampler.set_epoch(epoch_counter)
+                loader_iter = iter(loader)
+                batch = next(loader_iter)
+
             # forward
             losses = raw_model.compute_loss(batch)
             loss   = sum(losses.values()) / args.grad_accum
-
             loss.backward()
+            inner_step += 1
+            
+            # 累加未缩放的真实 Loss，用于计算平均值
+            running_loss_sum += sum(losses.values()).item()
+            running_steps += 1
 
-            if (step + 1) % args.grad_accum == 0:
+            if inner_step % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                
                 global_step += 1
+                pbar.update(1)
 
-                # logging
+                # Logging Text & TensorBoard
                 if global_step % args.log_every == 0 and is_primary():
+                    # 原有的控制台打印
                     loss_str = '  '.join(f'{k}: {v.item():.4f}' for k, v in losses.items())
-                    print_log(f"[epoch {epoch+1}  step {global_step}  lr {lr_scheduler.get_last_lr()[0]:.2e}]  {loss_str}")
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    pbar.set_description(f"lr: {current_lr:.2e} | {loss_str}")
+                    
+                    # 【新增】写入 TensorBoard
+                    if writer is not None:
+                        # 记录当前的学习率
+                        writer.add_scalar('train/lr', current_lr, global_step)
+                        # 记录加权汇总后的总 Loss (注意梯度累加的影响)
+                        writer.add_scalar('train/total_loss', loss.item() * args.grad_accum, global_step)
+                        # 记录各项单独的 Loss (例如 loss_image2image)
+                        for k, v in losses.items():
+                            writer.add_scalar(f'train/{k}', v.item(), global_step)
+                            
+                # Logging Image
+                if global_step % args.log_image_every == 0 and is_primary():
+                    log_training_images(raw_model, batch, global_step, args.output_dir, image_size=args.image_size)
 
-                # checkpoint
+                # Checkpoint: 留最新，留最好，删其他
                 if global_step % args.save_every == 0 and is_primary():
+                    # --- 1. 保存最新的模型 ---
                     ckpt_path = os.path.join(args.output_dir, f"step_{global_step}.pth")
                     torch.save(raw_model.state_dict(), ckpt_path)
-                    print_log(f"Saved checkpoint → {ckpt_path}")
+                    print_log(f"\nSaved latest checkpoint → {ckpt_path}")
+                    
+                    # 删除旧的最新模型
+                    if last_saved_ckpt is not None and os.path.exists(last_saved_ckpt):
+                        try:
+                            os.remove(last_saved_ckpt)
+                        except Exception as e:
+                            print_log(f"Failed to delete old checkpoint: {e}")
+                    last_saved_ckpt = ckpt_path
+
+                    # --- 2. 评估并保存最好的模型 ---
+                    avg_loss = running_loss_sum / max(1, running_steps)
+                    if avg_loss < best_loss:
+                        best_loss = avg_loss
+                        best_path = os.path.join(args.output_dir, f"best_step_{global_step}.pth")
+                        torch.save(raw_model.state_dict(), best_path)
+                        print_log(f"New best model found (avg loss: {best_loss:.4f}) → {best_path}")
+                        
+                        # 删除旧的最好模型
+                        if best_saved_ckpt is not None and os.path.exists(best_saved_ckpt) and best_saved_ckpt != best_path:
+                            try:
+                                os.remove(best_saved_ckpt)
+                            except Exception as e:
+                                print_log(f"Failed to delete old best checkpoint: {e}")
+                        best_saved_ckpt = best_path
+                    
+                    # 重置 Loss 统计状态，重新开始下一个周期的计算
+                    running_loss_sum = 0.0
+                    running_steps = 0
+                    
+                    
 
     # ── Final save ────────────────────────────────────────────────────
     if is_primary():
         final_path = os.path.join(args.output_dir, "final.pth")
         torch.save(raw_model.state_dict(), final_path)
         print_log(f"Training complete. Final model saved → {final_path}")
-
+        
+        if writer is not None:
+            writer.close()
 
 if __name__ == '__main__':
     main()

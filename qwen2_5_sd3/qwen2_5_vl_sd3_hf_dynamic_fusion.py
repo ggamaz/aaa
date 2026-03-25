@@ -15,8 +15,6 @@ from diffusers.training_utils import compute_density_for_timestep_sampling, comp
 from qwen2_5_sd3.modeling_connector import ConnectorConfig, ConnectorEncoder
 from qwen2_5_sd3.pipeline_stable_diffusion_3_dynamic import StableDiffusion3Pipeline, calculate_shift
 
-
-# ── 替换 xtuner / mmengine 依赖 ───────────────────────────────────────
 def guess_load_checkpoint(pth):
     checkpoint = torch.load(pth, map_location='cpu')
     if 'state_dict' in checkpoint:
@@ -310,17 +308,23 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             return self.compute_loss(data_dict=data)
         raise NotImplementedError(f"mode={mode} is not supported")
 
-    def compute_loss(self, data_dict):
-        losses = {}
-        for data_type in ('text2image', 'image2image'):
-            if data_type in data_dict:
-                losses[f'loss_{data_type}'] = getattr(self, f'{data_type}_loss')(data_dict[data_type])
-        if not losses:
-            if 'pixel_values_src' in data_dict:
-                losses['loss_image2image'] = self.image2image_loss(data_dict)
-            else:
-                losses['loss_text2image'] = self.text2image_loss(data_dict)
-        return losses
+    # def compute_loss(self, data_dict):
+    #     losses = {}
+    #     for data_type in ('text2image', 'image2image'):
+    #         if data_type in data_dict:
+    #             losses[f'loss_{data_type}'] = getattr(self, f'{data_type}_loss')(data_dict[data_type])
+        
+        
+    #     if not losses:
+    #         if 'pixel_values_src' in data_dict:
+    #             losses['loss_image2image'] = self.image2image_loss(data_dict)
+                
+    #             if 'texts_downstream' in data_dict:
+    #                 losses['loss_downstream'] = self.downstream_fusion_loss(data_dict)
+
+    #         else:
+    #             losses['loss_text2image'] = self.text2image_loss(data_dict)
+    #     return losses
     
     # ── Input preparation ─────────────────────────────────────────────
     def prepare_forward_input(self,
@@ -546,6 +550,130 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         pooled_out, seq_out = self._llm_forward_and_merge(inputs)
         return self.diff_loss(image_latents, pooled_out, seq_out, cond_intput=image_latents_src)
 
+    def compute_loss(self, data_dict):
+        losses = {}
+        if 'pixel_values_src' in data_dict:
+            # 1. 如果是纯视觉观感 prompt 的数据流 (常规 image2image)
+            if 'texts' in data_dict:
+                losses['loss_visual'] = self.image2image_loss(data_dict)
+            
+            # 2. 如果包含下游任务的 prompt 数据流
+            if 'texts_downstream' in data_dict:
+                losses['loss_downstream'] = self.image2image_downstream_loss(data_dict)
+        else:
+            losses['loss_text2image'] = self.text2image_loss(data_dict)
+        return losses
+
+    # === 组装下游任务的输入 ===
+    def image2image_downstream_loss(self, data_dict):
+        pixel_values_src = data_dict['pixel_values_src']
+        num_refs = [len(r) for r in pixel_values_src]
+
+        pixel_values_src_tensor = [[img.to(device=self.device, dtype=self.dtype) for img in refs]
+                                   for refs in pixel_values_src]
+
+        image_latents_src = [[self.pixels_to_latents(img[None])[0] for img in refs] for refs in pixel_values_src_tensor]
+        image_embeds, image_grid_thw = self.get_semantic_features_dynamic([img for refs in pixel_values_src_tensor for img in refs])
+        ref_lens = [len(x) for x in image_embeds]
+
+        # 如果没有 GT，这里的 image_latents 可以随便拿源图占位，因为下游不依赖最终图像的强监督
+        image_latents = [self.pixels_to_latents(p.to(device=self.device, dtype=self.dtype)[None])[0]
+                         for p in data_dict['pixel_values']]
+        b = len(image_latents)
+
+        # 提取下游专用的 prompt
+        text_inputs = self.prepare_image2image_prompts(data_dict['texts_downstream'], num_refs=num_refs, ref_lens=ref_lens)
+        query_emb   = self.meta_queries[None].expand(b, self.num_queries, -1)
+        inputs      = self.prepare_forward_input(query_embeds=query_emb,
+                                                 image_embeds=torch.cat(image_embeds),
+                                                 image_grid_thw=image_grid_thw,
+                                                 **text_inputs)
+
+        # 截断处理
+        max_len = self.max_length + max(num_refs) * max(ref_lens) + self.num_queries
+        truncated_inputs = {}
+        for k, v in inputs.items():
+            if k not in ('inputs_embeds', 'attention_mask', 'position_ids'):
+                continue
+            if k == 'inputs_embeds':
+                truncated_inputs[k] = v[:, -max_len:, :]
+            else:
+                truncated_inputs[k] = v[..., -max_len:]
+        inputs = truncated_inputs
+        
+        pooled_out, seq_out = self._llm_forward_and_merge(inputs)
+        
+        # 调用融合了两种 Loss 的新方法
+        return self.diff_and_downstream_loss(image_latents, pooled_out, seq_out, cond_intput=image_latents_src)
+
+    # === 新增：联合计算 Diff Loss 和 Downstream Loss ===
+    def diff_and_downstream_loss(self, model_input, pooled_prompt_embeds, prompt_embeds, cond_intput=None, lambda_down=0.1):
+        noise = [torch.randn_like(x) for x in model_input]
+        bsz   = len(model_input)
+
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme=self.weighting_scheme, batch_size=bsz,
+            logit_mean=self.logit_mean, logit_std=self.logit_std)
+
+        # (省略动态 Shifting 逻辑，直接用你原本的获取 Timesteps 的方式)
+        indices = (u * self.train_scheduler.config.num_train_timesteps).long()
+        indices = torch.clamp(indices, 0, self.train_scheduler.config.num_train_timesteps - 1)
+        
+        timesteps = self.train_scheduler.timesteps[indices].to(device=self.device)
+        sigmas    = self.train_scheduler.sigmas[indices].to(device=self.device, dtype=self.dtype)
+        sigmas    = sigmas.view(-1, 1, 1, 1)
+
+        # 加噪: x_t = (1-s)x_0 + s*n
+        noisy_input = [(1.0 - s) * x + s * n for s, x, n in zip(sigmas, model_input, noise)]
+
+        # 模型前向传播，预测目标速度 v
+        model_pred = self.transformer(
+            hidden_states=noisy_input,
+            cond_hidden_states=cond_intput,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=pooled_prompt_embeds,
+            timestep=timesteps,
+            return_dict=False,
+        )[0]
+
+        # -----------------------------------------------------------
+        # 第一部分：计算原本的流匹配/扩散 Loss
+        # -----------------------------------------------------------
+        weighting = compute_loss_weighting_for_sd3(weighting_scheme=self.weighting_scheme, sigmas=sigmas)
+        target    = [n - x for n, x in zip(noise, model_input)]
+        
+        loss_diff_list = [(w.float() * (p.float() - t.float()) ** 2).mean()
+                          for w, p, t in zip(weighting, model_pred, target)]
+        diff_loss_val = sum(loss_diff_list) / len(loss_diff_list)
+
+        # -----------------------------------------------------------
+        # 第二部分：推导 \hat{x}_0，计算下游任务 Loss
+        # -----------------------------------------------------------
+        # 根据 Flow Matching 公式: \hat{x}_0 = x_t - \sigma * v_pred
+        pred_x0_latents = [ni - s.float() * mp for ni, s, mp in zip(noisy_input, sigmas, model_pred)]
+        
+        loss_downstream_list = []
+        for i in range(bsz):
+            vi_latent = cond_intput[i][0]
+            ir_latent = cond_intput[i][1]
+            pred_x0 = pred_x0_latents[i]
+            w = weighting[i].float()
+            
+            # 举例：在潜空间中，要求融合结果保留可见光和红外的最高强度（显著性目标）
+            # 或者你可以在此处插入针对下游网络提取的特征差异
+            target_intensity = torch.maximum(vi_latent, ir_latent)
+            
+            # 使用 L1 Loss 可以更好地保持硬结构边缘
+            custom_constraint = F.l1_loss(pred_x0.float(), target_intensity.float())
+            
+            # 乘以时间步权重，因为在极端时间步下，推导出的 x_0 误差极大，不需要过度约束
+            loss_downstream_list.append(w * custom_constraint)
+
+        downstream_loss_val = sum(loss_downstream_list) / len(loss_downstream_list)
+
+        # 将两者相加返回
+        return diff_loss_val + lambda_down * downstream_loss_val
+
     # ── Generation ───────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -564,7 +692,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
 
         if pixel_values_src is not None:
             num_refs = [len(r) for r in pixel_values_src]
-            pixel_values_src = [[img.to(self.dtype, self.device) for img in refs] for refs in pixel_values_src]
+            pixel_values_src = [[img.to(device=self.device, dtype=self.dtype)  for img in refs] for refs in pixel_values_src]
             image_embeds, image_grid_thw = self.get_semantic_features_dynamic(
                 [img for refs in pixel_values_src for img in refs])
             ref_lens = [len(x) for x in image_embeds]
@@ -619,7 +747,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             weighting_scheme=self.weighting_scheme, batch_size=bsz,
             logit_mean=self.logit_mean, logit_std=self.logit_std)
 
-        if self.train_scheduler.use_dynamic_shifting:
+        if self.train_scheduler.config.use_dynamic_shifting:
             assert self.weighting_scheme == 'logit_normal'
             image_seq_lens = [math.prod(x.shape[-2:]) // self.transformer.patch_size ** 2
                               for x in model_input]
@@ -643,8 +771,12 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             sigmas    = sigmas.view(-1, 1, 1, 1)
         else:
             indices   = (u * self.train_scheduler.config.num_train_timesteps).long()
+            indices   = torch.clamp(indices, 0, self.train_scheduler.config.num_train_timesteps - 1)
+            
             timesteps = self.train_scheduler.timesteps[indices].to(device=self.device)
-            sigmas    = self.get_sigmas(timesteps, n_dim=model_input[0].ndim + 1)
+            # 【修复】直接用算好的 indices 去取 sigmas，彻底避开浮点匹配和 .item() 的深坑
+            sigmas    = self.train_scheduler.sigmas[indices].to(device=self.device, dtype=self.dtype)
+            sigmas    = sigmas.view(-1, 1, 1, 1)
 
         noisy_input = [(1.0 - s) * x + s * n for s, x, n in zip(sigmas, model_input, noise)]
 
