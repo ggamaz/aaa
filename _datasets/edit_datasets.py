@@ -1,3 +1,6 @@
+import math
+
+from click import prompt
 import torch
 import numpy as np
 from einops import rearrange
@@ -9,7 +12,6 @@ from PIL import Image
 import os
 import io
 import json
-import random
 import torch
 try:
     from aoss_client.client import Client
@@ -19,7 +21,7 @@ except:
     except:
         Client = None
 from glob import glob
-from .utils import crop2square, resize_image_fix_pixels, resize_image_dynamic
+from .utils import crop2square, resize_image_fix_pixels, resize_image_dynamic, paired_random_crop
 from einops import rearrange
 import numpy as np
 
@@ -340,76 +342,52 @@ class MultiImageEditDataset(CaptionDataset):
             print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
             return self._retry()
 
-class MultiImageMultiPromptDataset(MultiImageEditDataset):
+class TwoImageEditDataset(ImageEditDataset):
+    
+    def _process_image_group(self, images):
+        w, h = images[0].size
+        if w < self.image_size or h < self.image_size:
+            ratio = max(self.image_size / w, self.image_size / h)
+            new_w, new_h = math.ceil(w * ratio), math.ceil(h * ratio)
+            images = [img.resize((new_w, new_h), Image.BILINEAR) for img in images]
+
+        cropped_images = paired_random_crop(images, size=self.image_size)
+
+        cw, ch = cropped_images[0].size
+        assert cw % self.unit_image_size == 0, f"Crop width {cw} is not divisible by {self.unit_image_size}"
+        assert ch % self.unit_image_size == 0, f"Crop height {ch} is not divisible by {self.unit_image_size}"
+
+        pixel_values = torch.from_numpy(np.array(cropped_images)).float()
+        pixel_values = pixel_values / 255.0
+        pixel_values = 2.0 * pixel_values - 1.0
+        pixel_values = rearrange(pixel_values, 'b h w c -> b c h w').contiguous()
+
+        return pixel_values[0], pixel_values[1], pixel_values[2]
+
     def __getitem__(self, idx):
         if self.debug:
             idx = 0
         try:
             data_sample = self.data_list[idx]
-            if self.image_folder is not None:
-                source_images = []
-                for img_path in data_sample['input_image']:
-                    img = Image.open(os.path.join(self.image_folder, img_path)).convert('RGB')
-                    source_images.append(img)
-                target_image = Image.open(os.path.join(self.image_folder, data_sample['output_image'])).convert('RGB')
-            else:
-                source_images =[]
-                for img_path in data_sample['input_image']:
-                    img = Image.open(img_path).convert('RGB')
-                    source_images.append(img)
-                target_image = Image.open(data_sample['output_image']).convert('RGB')
+            if self.image_folder is None:
+                self.image_folder = ""    
+                
+            visible_image = Image.open(os.path.join(self.image_folder, data_sample['input_v_image'])).convert('RGB')
+            infrared_image = Image.open(os.path.join(self.image_folder, data_sample['input_ir_image'])).convert('RGB')
+            target_image = Image.open(os.path.join(self.image_folder, data_sample['output_image'])).convert('RGB')
+            visible_pixel_values, infrared_pixel_values, target_pixel_values = self._process_image_group([visible_image, infrared_image, target_image])
 
-            # prompt = data_sample['instruction']
+            # 随机选择 Prompt 并打上类型标签
             prompt_visual = data_sample.get('instruction', 'fuse for visual quality')
             prompt_downstream = data_sample.get('instruction_downstream', 'fuse for downstream detection task')
-
-            pixel_values_src = []
-            for img in source_images:
-                pixel_values_src.append(self._process_image(img))
-            pixel_values = self._process_image(target_image)
-
-            # # 处理两种 Text
-            # data_visual = self._process_text(prompt_visual) if self.tokenizer is not None else dict()
-            # data_downstream = self._process_text(prompt_downstream) if self.tokenizer is not None else dict()
             
             return dict(
-                pixel_values_src=pixel_values_src,
-                pixel_values=pixel_values,
-                image_dir=self.image_folder,
-                
-                text=prompt_visual, # 视觉任务所需
-                # input_ids=data_visual.get('input_ids', None),
-                text_downstream=prompt_downstream,# 下游任务所需
-                # input_ids_downstream=data_downstream.get('input_ids', None),
+                pixel_values_src=[visible_pixel_values, infrared_pixel_values],
+                pixel_values=target_pixel_values,
+                texts=[prompt_visual, prompt_downstream],
+                prompt_types=['visual', 'downstream']
             )
-        except Exception as e:
-            print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
-            return self._retry()
-
-
-class ReconstructDataset(CaptionDataset):
-    def _process_image(self, image):
-        assert self.image_process != 'crop2square'
-        return super()._process_image(image)['pixel_values']
-
-    def __getitem__(self, idx):
-        if self.debug:
-            idx = 0
-        try:
-            data_sample = self.data_list[idx]
-            image = self._read_image(data_sample['image']).convert('RGB')
-            prompt = "Keep the image as it is."
-            pixel_values = pixel_values_src = self._process_image(image)
-
-            data = self._process_text(prompt) if self.tokenizer is not None else dict()
-
-            data.update(
-                pixel_values_src=pixel_values_src, pixel_values=pixel_values,
-                image_dir=self.image_folder, image_file=data_sample['image'],
-                type='image2image', text=prompt)
-
-            return data
-
+            
         except Exception as e:
             print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
             return self._retry()

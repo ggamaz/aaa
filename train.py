@@ -14,11 +14,11 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer
 
 from qwen2_5_sd3.transformer_sd3_dynamic import SD3Transformer2DModel
 from qwen2_5_sd3.qwen2_5_vl_sd3_hf_dynamic_fusion import Qwen2p5VLStableDiffusion3HF, guess_load_checkpoint, print_log
-from _datasets.edit_datasets import MultiImageEditDataset, MultiImageMultiPromptDataset
+from _datasets.edit_datasets import MultiImageEditDataset, TwoImageEditDataset
 from tqdm import tqdm
 
 from log_helper import log_training_images_threeline as log_training_images
-from log_helper import print_log
+from log_helper import print_log, init_logger
 
 SD3_PATH  = "pretrain_ckpts/UniPic2-SD3.5M-Kontext-2B"
 QWEN_PATH = "pretrain_ckpts/Qwen2.5-VL-3B-Instruct"
@@ -49,8 +49,8 @@ CONNECTOR_CFG = dict(
 def parse_args():
     parser = argparse.ArgumentParser()
     # data
-    parser.add_argument('--data_path',       type=str, default="/root/aaa/COCO/images")
-    parser.add_argument('--image_folder',    type=str, default="")
+    parser.add_argument('--data_path',       type=str, default="/root/aaa/COCO/images/fusion_dataset_degrade.json")
+    parser.add_argument('--image_folder',    type=str, default="/root/aaa/COCO/images")
     parser.add_argument('--image_size',      type=int, default=512)
     parser.add_argument('--image_length',    type=int, default=256)
     parser.add_argument('--image_process',   type=str, default='dynamic',
@@ -68,14 +68,14 @@ def parse_args():
     parser.add_argument('--save_every',      type=int, default=1000)
     parser.add_argument('--log_every',       type=int, default=1)
     parser.add_argument('--log_image_every', type=int, default=10, help="Log generated images every N steps")
-    parser.add_argument('--num_workers',     type=int, default=4)
+    parser.add_argument('--num_workers',     type=int, default=8)
     parser.add_argument('--seed',            type=int, default=42)
     
     # model
     parser.add_argument('--num_queries',     type=int, default=128)
     parser.add_argument('--max_length',      type=int, default=1024)
     parser.add_argument('--freeze_lmm',      action='store_true', default=True)
-    parser.add_argument('--freeze_transformer', action='store_true', default=True)
+    parser.add_argument('--freeze_transformer', action='store_true', default=False)
     parser.add_argument('--use_activation_checkpointing', action='store_true', default=False)
     
     # distributed
@@ -84,18 +84,14 @@ def parse_args():
 
 
 # ── Collate ───────────────────────────────────────────────────────────
-
 def collate_fn(batch):
     collated = dict(
         pixel_values_src=[b['pixel_values_src'] for b in batch],  # list[list[Tensor]]
         pixel_values    =[b['pixel_values']      for b in batch], # list[Tensor]
-        texts           =[b['text']              for b in batch], # list[str]
+        texts           =[b['texts']              for b in batch], # list[str] (已经是在 Dataset 中随机选好的)
+        prompt_types    =[b['prompt_types']       for b in batch], # list[str] (标记选的是 visual 还是 downstream)
     )
-    # 如果 dataset 返回了下游任务 prompt，一并打包
-    if 'text_downstream' in batch[0]:
-        collated['texts_downstream'] = [b['text_downstream'] for b in batch]
     return collated
-
 
 # ── DDP helpers ───────────────────────────────────────────────────────
 
@@ -123,11 +119,14 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+
+    init_logger(args.output_dir)
+
     print_log("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(QWEN_PATH, trust_remote_code=True, padding_side='left')
 
     print_log("Building dataset...")
-    dataset = MultiImageMultiPromptDataset(
+    dataset = TwoImageEditDataset(
         data_path=args.data_path,
         image_folder=args.image_folder,
         tokenizer=tokenizer,
@@ -171,7 +170,7 @@ def main():
         train_scheduler=scheduler,         # 训练用原来的
         test_scheduler=test_scheduler,     # <--- 测试用深拷贝出来的
         vae=vae,
-        lmm=lmm,
+        lmm=lmm, #Qwen2_5_VLForConditionalGeneration
         tokenizer=tokenizer,
         prompt_template=PROMPT_TEMPLATE,
         connector=CONNECTOR_CFG,
@@ -179,6 +178,7 @@ def main():
         max_length=args.max_length,
         freeze_lmm=args.freeze_lmm,
         freeze_transformer=args.freeze_transformer,
+        max_steps=args.max_steps,  # [新增] 传入总训练步数以便 AdaLoRA 动态调整
         use_activation_checkpointing=args.use_activation_checkpointing,
         pretrained_pth=None,
     ).to(device=device, dtype=torch.bfloat16)
@@ -229,9 +229,7 @@ def main():
     running_loss_sum = 0.0  # 累计 Loss
     running_steps = 0       # 累计步数
 
-    # =================================================================
     # 新增逻辑：在正式训练前，先记录一次 Step 0 的生图状态
-    # 为了防止 DDP 卡死，让所有卡都 next 一次数据，但只在主卡生图
     if is_primary():
         print_log("Logging initial image before training starts (step 0)...")
     try:
@@ -241,8 +239,9 @@ def main():
     except Exception as e:
         if is_primary():
             print_log(f"Failed to log initial image: {e}")
-    # =================================================================
 
+    if is_ddp:
+            dist.barrier()
     model.train()
     
     with tqdm(total=args.max_steps, disable=not is_primary()) as pbar:
@@ -270,6 +269,10 @@ def main():
                 torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
+                # [修改] 通过 freeze_transformer 判断是否需要调用 AdaLoRA 的裁剪逻辑
+                if raw_model.freeze_transformer:
+                    raw_model.transformer.base_model.update_and_allocate(global_step)
+                    
                 optimizer.zero_grad()
                 
                 global_step += 1
@@ -282,20 +285,18 @@ def main():
                     current_lr = lr_scheduler.get_last_lr()[0]
                     pbar.set_description(f"lr: {current_lr:.2e} | {loss_str}")
                     
-                    # 【新增】写入 TensorBoard
                     if writer is not None:
-                        # 记录当前的学习率
                         writer.add_scalar('train/lr', current_lr, global_step)
-                        # 记录加权汇总后的总 Loss (注意梯度累加的影响)
                         writer.add_scalar('train/total_loss', loss.item() * args.grad_accum, global_step)
-                        # 记录各项单独的 Loss (例如 loss_image2image)
                         for k, v in losses.items():
                             writer.add_scalar(f'train/{k}', v.item(), global_step)
                             
                 # Logging Image
                 if global_step % args.log_image_every == 0 and is_primary():
                     log_training_images(raw_model, batch, global_step, args.output_dir, image_size=args.image_size)
-
+                    if is_ddp:
+                        dist.barrier()
+                        
                 # Checkpoint: 留最新，留最好，删其他
                 if global_step % args.save_every == 0 and is_primary():
                     # --- 1. 保存最新的模型 ---
@@ -327,10 +328,11 @@ def main():
                                 print_log(f"Failed to delete old best checkpoint: {e}")
                         best_saved_ckpt = best_path
                     
-                    # 重置 Loss 统计状态，重新开始下一个周期的计算
                     running_loss_sum = 0.0
                     running_steps = 0
-                    
+
+                if is_ddp:
+                    dist.barrier()
                     
 
     # ── Final save ────────────────────────────────────────────────────
@@ -341,6 +343,10 @@ def main():
         
         if writer is not None:
             writer.close()
+    
+    if is_ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 if __name__ == '__main__':
     main()

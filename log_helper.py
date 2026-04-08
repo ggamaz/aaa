@@ -3,10 +3,65 @@ import torch
 import textwrap
 import os
 
+import logging
+import sys
+import torch.distributed as dist
 
-def print_log(msg, logger=None):
-    print(msg, flush=True)
+# 全局 Logger 实例
+_logger = None
 
+def init_logger(output_dir, log_file_name="training.log"):
+    """
+    初始化全局 Logger。
+    - 主进程 (Rank 0) 会输出 INFO 级别的日志到控制台，并写入文件。
+    - 其他进程只会在发生 WARNING 或 ERROR 时输出，避免终端刷屏。
+    """
+    global _logger
+    
+    # 检查是否为 DDP 环境以及当前进程的 Rank
+    rank = int(os.environ.get('LOCAL_RANK', 0))
+    is_primary = (not dist.is_available()) or (not dist.is_initialized()) or rank == 0
+
+    _logger = logging.getLogger("DiffusersTrainer")
+    _logger.propagate = False # 防止重复打印
+    
+    # 主卡记录所有信息，副卡只记录警告和错误
+    _logger.setLevel(logging.INFO if is_primary else logging.WARNING)
+
+    # 如果已经初始化过，直接跳过 (防止重复添加 Handler)
+    if not _logger.handlers:
+        # 定义日志格式
+        formatter = logging.Formatter(
+            fmt="[%(asctime)s] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        
+        # 1. 控制台 Handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        _logger.addHandler(console_handler)
+        
+        # 2. 文件 Handler (仅主卡写入文件，防止多进程写同一文件冲突)
+        if is_primary:
+            os.makedirs(output_dir, exist_ok=True)
+            log_path = os.path.join(output_dir, log_file_name)
+            file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+            file_handler.setFormatter(formatter)
+            _logger.addHandler(file_handler)
+
+def print_log(msg, level="info"):
+    """
+    向后兼容的日志打印函数。
+    直接替换原来的 print_log，使用方式完全不变。
+    """
+    if _logger is None:
+        # 兜底方案：如果忘记调用 init_logger，退化为普通带刷新的 print
+        print(msg, flush=True)
+        return
+        
+    # 获取对应的日志级别方法 (info, warning, error)
+    log_method = getattr(_logger, level.lower(), _logger.info)
+    log_method(str(msg))
 
 # ── Visualization Helper ──────────────────────────────────────────────
 @torch.no_grad()
@@ -103,9 +158,22 @@ def log_training_images_threeline(model, batch, step, output_dir, image_size=512
     model.eval()
     
     try:
-        # 1. 获取两种 Prompt
-        text_visual = batch['texts'][0]
-        text_downstream = batch.get('texts_downstream', [None])[0]
+        # 1. 动态解析两种 Prompt (适配最新的 Dataset 多任务结构)
+        sample_texts = batch['texts'][0]
+        sample_types = batch['prompt_types'][0]
+        
+        text_visual = None
+        text_downstream = None
+        
+        if 'visual' in sample_types:
+            text_visual = sample_texts[sample_types.index('visual')]
+        if 'downstream' in sample_types:
+            text_downstream = sample_texts[sample_types.index('downstream')]
+            
+        # 兜底：如果没找到 visual，强制取第一个 prompt 防止崩溃
+        if text_visual is None:
+            text_visual = sample_texts[0]
+            
         has_downstream = text_downstream is not None
 
         # 2. 获取输入参考图 (VI 和 IR)
@@ -186,7 +254,7 @@ def log_training_images_threeline(model, batch, step, output_dir, image_size=512
         rows.append(concat_row(row2_imgs))
 
         # 第三行：Prompt Downstream -> Gen Downstream (如果存在)
-        if has_downstream:
+        if has_downstream and len(gen_imgs) > 1:
             row3_imgs = [draw_text_image(text_downstream, "Downstream"), gen_imgs[1]]
             rows.append(concat_row(row3_imgs))
             
@@ -207,7 +275,7 @@ def log_training_images_threeline(model, batch, step, output_dir, image_size=512
         final_img.save(save_path)
         
     except Exception as e:
-        print_log(f"Visualization failed at step {step}: {e}")
+        print(f"Visualization failed at step {step}: {e}")
         
     finally:
         model.train()

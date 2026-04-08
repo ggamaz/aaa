@@ -153,3 +153,43 @@ def encode_fn(example,
         else:
             assert truncation is None
     return {'input_ids': input_ids, 'labels': labels}
+
+
+def paired_random_crop(images, size):
+    """
+    对一组多模态图像进行位置完全对齐的随机裁剪。
+    
+    :param images: 包含多个 PIL Image 的列表，例如 [vis_img, ir_img, target_img]
+    :param size: int 或 tuple (target_height, target_width)
+    :return: 裁剪后相同大小的 PIL Image 列表
+    """
+    if not images:
+        return images
+
+    # 解析目标尺寸
+    if isinstance(size, int):
+        target_h = target_w = size
+    else:
+        target_h, target_w = size
+
+    # 以组内第一张图像的尺寸为基准
+    w, h = images[0].size
+
+    # 如果原图刚好等于目标尺寸，直接返回
+    if w == target_w and h == target_h:
+        return images
+
+    # 防止目标尺寸大于原图尺寸导致越界报错
+    crop_w = min(target_w, w)
+    crop_h = min(target_h, h)
+
+    # 随机生成同一个裁剪框的左上角坐标
+    x0 = random.randint(0, w - crop_w)
+    y0 = random.randint(0, h - crop_h)
+    x1 = x0 + crop_w
+    y1 = y0 + crop_h
+
+    # 对传入的每一张图像应用完全相同的裁剪框
+    cropped_images = [img.crop((x0, y0, x1, y1)) for img in images]
+
+    return cropped_images

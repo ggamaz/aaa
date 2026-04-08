@@ -211,3 +211,4 @@ COCO/**
 output/**
 pretrain_ckpts
 *.json
+*.txt

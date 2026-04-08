@@ -8,9 +8,8 @@ import torch.distributed as dist
 from torch.nn.modules.module import T
 from functools import partial
 from copy import deepcopy
-from six.moves import map, zip
 from einops import rearrange
-from peft import LoraConfig
+from peft import LoraConfig, AdaLoraConfig, get_peft_model
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from qwen2_5_sd3.modeling_connector import ConnectorConfig, ConnectorEncoder
 from qwen2_5_sd3.pipeline_stable_diffusion_3_dynamic import StableDiffusion3Pipeline, calculate_shift
@@ -61,7 +60,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                  train_scheduler,
                  test_scheduler,
                  vae,
-                 lmm,
+                 lmm, 
                  tokenizer,
                  prompt_template,
                  connector,
@@ -76,7 +75,9 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                  lora_modules='auto',
                  lora_rank=64,
                  lora_alpha=128,
-                 freeze_transformer=True,
+                 freeze_transformer=True,    # True -> 注入 AdaLoRA, False -> 全参数微调
+                 max_steps=10000,            # 传入总训练步数以便 AdaLoRA 动态调整
+                 dit_adalora_config=None,    # AdaLoRA 参数配置
                  unconditional=0.1,
                  ema_cfg=None,
                  weighting_scheme='none',
@@ -94,9 +95,34 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         # ── Transformer (DiT) ─────────────────────────────────────────
         self.transformer = transformer
         self.freeze_transformer = freeze_transformer
-        if freeze_transformer:
-            self.transformer.requires_grad_(False)
 
+        # [修改] 仅依据 freeze_transformer 来判断是否注入 AdaLoRA
+        if self.freeze_transformer:
+            print_log("freeze_transformer=True: Applying AdaLoRA to Transformer (DiT)...")
+            
+            tfinal_suggest = int(max_steps * 0.8) if max_steps > 0 else 1000
+            default_adalora_cfg = dict(
+                init_r=16,          
+                target_r=8,         
+                beta1=0.85,
+                beta2=0.85,
+                tinit=200,          
+                tfinal=tfinal_suggest, 
+                deltaT=10,          
+                lora_alpha=32,
+                lora_dropout=0.05,
+                target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_q_proj", "add_v_proj", "linear"],
+                total_step=max_steps   
+            )
+            if dit_adalora_config is not None:
+                default_adalora_cfg.update(dit_adalora_config)
+            
+            peft_config = AdaLoraConfig(**default_adalora_cfg)
+            self.transformer = get_peft_model(self.transformer, peft_config)
+            
+        else:
+            print_log("freeze_transformer=False: Transformer (DiT) will be fully fine-tuned.")
+            
         # ── VAE ───────────────────────────────────────────────────────
         self.vae = vae
         self.vae.requires_grad_(False)
@@ -148,7 +174,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         if use_activation_checkpointing:
             self.gradient_checkpointing_enable()
 
-        # ── LoRA ──────────────────────────────────────────────────────
+        # ── LoRA (For LMM) ────────────────────────────────────────────
         if lora_modules is not None:
             assert self.freeze_lmm, "LoRA requires freeze_lmm=True"
             self.llm.config.tie_word_embeddings = False
@@ -173,8 +199,10 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         if ema_cfg is not None:
             self.ema = nn.ModuleDict()
             self.ema.steps = 0
+            # [修改] 仅在全量微调 (freeze_transformer=False) 时进行 EMA 复制
             if not self.freeze_transformer:
                 self.ema.update(dict(transformer=deepcopy(self.transformer)))
+                
             if not self.freeze_mq:
                 self.ema.update(dict(
                     projector_1=deepcopy(self.projector_1),
@@ -233,11 +261,38 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         self.transformer.disable_gradient_checkpointing()
         self.connector.gradient_checkpointing = False
 
+
     def state_dict(self, *args, **kwargs) -> dict:
         sd = super().state_dict(*args, **kwargs)
-        # exclude frozen / non-trainable blobs to keep checkpoints small
-        return {k: v for k, v in sd.items()
-                if not any(k.startswith(p) for p in ('vae.', 'lmm.', 'ema.'))}
+        filtered_sd = {}
+        
+        for k, v in sd.items():
+            k_lower = k.lower()
+            
+            if 'lora' in k_lower or 'bilalora' in k_lower or 'adalora' in k_lower: # 1. 强制保存所有微调模块权重
+                filtered_sd[k] = v
+                continue
+            if 'ranknum' in k_lower:  # 2. 强制保存 AdaLoRA 的动态秩状态记录器
+                filtered_sd[k] = v
+                continue
+            
+            if any(k.startswith(p) for p in ('vae.', 'ema.')): # 3. 过滤掉无需保存的巨型基础网络结构
+                continue
+            if k.startswith('lmm.') and self.freeze_lmm:
+                continue
+                
+            # 4. 精准控制 Transformer 基础权重的保存
+            if k.startswith('transformer.'):
+                if self.freeze_transformer: # freeze_transformer=True 意味着启用了 AdaLoRA，基础模型不保存
+                    continue
+                else: # freeze_transformer=False 意味着全参数微调，必须保存
+                    filtered_sd[k] = v
+                    continue
+                    
+            # 5. 保存其余解冻的训练层 (Connector, Projectors 等)
+            filtered_sd[k] = v
+            
+        return filtered_sd
 
     # ── EMA ──────────────────────────────────────────────────────────
 
@@ -307,24 +362,6 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             self.ema_step()
             return self.compute_loss(data_dict=data)
         raise NotImplementedError(f"mode={mode} is not supported")
-
-    # def compute_loss(self, data_dict):
-    #     losses = {}
-    #     for data_type in ('text2image', 'image2image'):
-    #         if data_type in data_dict:
-    #             losses[f'loss_{data_type}'] = getattr(self, f'{data_type}_loss')(data_dict[data_type])
-        
-        
-    #     if not losses:
-    #         if 'pixel_values_src' in data_dict:
-    #             losses['loss_image2image'] = self.image2image_loss(data_dict)
-                
-    #             if 'texts_downstream' in data_dict:
-    #                 losses['loss_downstream'] = self.downstream_fusion_loss(data_dict)
-
-    #         else:
-    #             losses['loss_text2image'] = self.text2image_loss(data_dict)
-    #     return losses
     
     # ── Input preparation ─────────────────────────────────────────────
     def prepare_forward_input(self,
@@ -427,16 +464,10 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         image_grid_thw = torch.tensor(
             [(grid_t, grid_h, grid_w)] * b, device=self.device, dtype=torch.long)
 
-        # ── 关键修复：先拿 unmerged hidden states，再显式调 merger ──────────
-        # last_hidden_state shape: [b * grid_t * grid_h * grid_w, d]  (未合并)
         image_embeds = self.lmm.model.visual(
             pixel_values, grid_thw=image_grid_thw).last_hidden_state
 
-        # merger shape 变换: [N*merge², d] → [N, d_model]
-        # 其中 N = b * grid_t * (grid_h // merge) * (grid_w // merge)
-        image_embeds = self.lmm.model.visual.merger(image_embeds)   # ← 这行是关键
-
-        # 合并后每张图 token 数 = grid_t * (grid_h//merge) * (grid_w//merge)
+        image_embeds = self.lmm.model.visual.merger(image_embeds)
         image_embeds = rearrange(image_embeds, '(b l) d -> b l d', b=b)
 
         return image_embeds, image_grid_thw
@@ -488,10 +519,6 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         query_emb   = self.meta_queries[None].expand(b, self.num_queries, -1)
         inputs      = self.prepare_forward_input(query_embeds=query_emb, **text_inputs)
 
-        # max_len = self.max_length + self.num_queries
-        # inputs  = {k: v[..., -max_len:] if v is not None else v for k, v in inputs.items()
-        #            if k in ('inputs_embeds', 'attention_mask', 'position_ids')}
-        # text2image_loss 里同样替换
         max_len = self.max_length + self.num_queries
         truncated_inputs = {}
         for k, v in inputs.items():
@@ -500,7 +527,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             if v is None:
                 truncated_inputs[k] = v
             elif k == 'inputs_embeds':
-                truncated_inputs[k] = v[:, -max_len:, :]   # ✅ 截 seq 维
+                truncated_inputs[k] = v[:, -max_len:, :] 
             else:
                 truncated_inputs[k] = v[..., -max_len:]
         inputs = truncated_inputs
@@ -531,19 +558,15 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                                                  image_grid_thw=image_grid_thw,
                                                  **text_inputs)
 
-        # max_len = self.max_length + max(num_refs) * max(ref_lens) + self.num_queries
-        # inputs  = {k: v[..., -max_len:] for k, v in inputs.items()
-        #            if k in ('inputs_embeds', 'attention_mask', 'position_ids')}
-
         max_len = self.max_length + max(num_refs) * max(ref_lens) + self.num_queries
         truncated_inputs = {}
         for k, v in inputs.items():
             if k not in ('inputs_embeds', 'attention_mask', 'position_ids'):
                 continue
             if k == 'inputs_embeds':
-                truncated_inputs[k] = v[:, -max_len:, :]   # ✅ 截 seq 维
+                truncated_inputs[k] = v[:, -max_len:, :]  
             else:
-                truncated_inputs[k] = v[..., -max_len:]     # attention_mask/position_ids
+                truncated_inputs[k] = v[..., -max_len:] 
         inputs = truncated_inputs
         
         
@@ -552,19 +575,76 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
 
     def compute_loss(self, data_dict):
         losses = {}
-        if 'pixel_values_src' in data_dict:
-            # 1. 如果是纯视觉观感 prompt 的数据流 (常规 image2image)
-            if 'texts' in data_dict:
-                losses['loss_visual'] = self.image2image_loss(data_dict)
+        if 'pixel_values_src' in data_dict and 'prompt_types' in data_dict:
+            # 根据 prompt_types 拆分当前 Batch
+            visual_idx = [i for i, pt in enumerate(data_dict['prompt_types']) if pt == 'visual']
+            down_idx   = [i for i, pt in enumerate(data_dict['prompt_types']) if pt == 'downstream']
+
+            # 1. 计算常规视觉融合 Loss
+            if len(visual_idx) > 0:
+                visual_dict = {
+                    'pixel_values_src': [data_dict['pixel_values_src'][i] for i in visual_idx],
+                    'pixel_values':     [data_dict['pixel_values'][i]     for i in visual_idx],
+                    'texts':            [data_dict['texts'][i]            for i in visual_idx],
+                }
+                # 注意：由于拆分了 Batch，Loss 算出来是均值，为了保证总体梯度等价，我们乘以占比权重
+                weight = len(visual_idx) / len(data_dict['texts'])
+                losses['loss_visual'] = self.image2image_loss(visual_dict) * weight
             
-            # 2. 如果包含下游任务的 prompt 数据流
-            if 'texts_downstream' in data_dict:
-                losses['loss_downstream'] = self.image2image_downstream_loss(data_dict)
+            # 2. 计算下游检测任务融合 Loss
+            if len(down_idx) > 0:
+                down_dict = {
+                    'pixel_values_src': [data_dict['pixel_values_src'][i] for i in down_idx],
+                    'pixel_values':     [data_dict['pixel_values'][i]     for i in down_idx],
+                    'texts':            [data_dict['texts'][i]            for i in down_idx],
+                }
+                weight = len(down_idx) / len(data_dict['texts'])
+                losses['loss_downstream'] = self.image2image_downstream_loss(down_dict) * weight
+                
         else:
             losses['loss_text2image'] = self.text2image_loss(data_dict)
+            
+        return losses
+    
+    def compute_loss(self, data_dict):
+        losses = {}
+        if 'pixel_values_src' in data_dict and 'prompt_types' in data_dict:
+            # 1. 随机决定当前 Batch 要训练哪个任务
+            task_choice = random.choice(['visual', 'downstream'])
+            
+            selected_texts = []
+            
+            # 2. 遍历当前 Batch，提取被选中任务对应的 prompt
+            for b_idx, p_types in enumerate(data_dict['prompt_types']):
+                sample_texts = data_dict['texts'][b_idx]
+                
+                if task_choice in p_types:
+                    idx = p_types.index(task_choice)
+                    selected_texts.append(sample_texts[idx])
+                else:                     # 兜底容错：如果个别数据由于某种原因缺失了这个任务，默认取它的第一个 prompt
+                    selected_texts.append(sample_texts[0])
+
+            # 3. 组装当前任务的数据字典
+            task_dict = {
+                'pixel_values_src': data_dict['pixel_values_src'],
+                'pixel_values': data_dict['pixel_values'],
+                'texts': selected_texts,
+            }
+
+            # 4. 只执行被选中任务的 Loss 计算
+            if task_choice == 'visual':
+                losses['loss_visual'] = self.image2image_loss(task_dict)
+            else:
+                losses['loss_downstream'] = self.image2image_downstream_loss(task_dict)
+                
+        else:
+            # 兜底：处理常规的 T2I (Text-to-Image) 数据
+            losses['loss_text2image'] = self.text2image_loss(data_dict)
+            
         return losses
 
-    # === 组装下游任务的输入 ===
+
+    # === 修改：直接使用 'texts' 而不是 'texts_downstream' ===
     def image2image_downstream_loss(self, data_dict):
         pixel_values_src = data_dict['pixel_values_src']
         num_refs = [len(r) for r in pixel_values_src]
@@ -576,13 +656,11 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         image_embeds, image_grid_thw = self.get_semantic_features_dynamic([img for refs in pixel_values_src_tensor for img in refs])
         ref_lens = [len(x) for x in image_embeds]
 
-        # 如果没有 GT，这里的 image_latents 可以随便拿源图占位，因为下游不依赖最终图像的强监督
         image_latents = [self.pixels_to_latents(p.to(device=self.device, dtype=self.dtype)[None])[0]
                          for p in data_dict['pixel_values']]
         b = len(image_latents)
 
-        # 提取下游专用的 prompt
-        text_inputs = self.prepare_image2image_prompts(data_dict['texts_downstream'], num_refs=num_refs, ref_lens=ref_lens)
+        text_inputs = self.prepare_image2image_prompts(data_dict['texts'], num_refs=num_refs, ref_lens=ref_lens)
         query_emb   = self.meta_queries[None].expand(b, self.num_queries, -1)
         inputs      = self.prepare_forward_input(query_embeds=query_emb,
                                                  image_embeds=torch.cat(image_embeds),
@@ -603,8 +681,8 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         
         pooled_out, seq_out = self._llm_forward_and_merge(inputs)
         
-        # 调用融合了两种 Loss 的新方法
         return self.diff_and_downstream_loss(image_latents, pooled_out, seq_out, cond_intput=image_latents_src)
+    
 
     # === 新增：联合计算 Diff Loss 和 Downstream Loss ===
     def diff_and_downstream_loss(self, model_input, pooled_prompt_embeds, prompt_embeds, cond_intput=None, lambda_down=0.1):
@@ -615,7 +693,6 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             weighting_scheme=self.weighting_scheme, batch_size=bsz,
             logit_mean=self.logit_mean, logit_std=self.logit_std)
 
-        # (省略动态 Shifting 逻辑，直接用你原本的获取 Timesteps 的方式)
         indices = (u * self.train_scheduler.config.num_train_timesteps).long()
         indices = torch.clamp(indices, 0, self.train_scheduler.config.num_train_timesteps - 1)
         
@@ -805,143 +882,3 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-
-# ── Image resize utility ──────────────────────────────────────────────
-
-def resize_image(x, image_size, unit_image_size=32):
-    w, h = x.size
-    if w >= h and w >= image_size:
-        target_w = image_size
-        target_h = math.ceil(h * target_w / w / unit_image_size) * unit_image_size
-    elif h > w and h >= image_size:
-        target_h = image_size
-        target_w = math.ceil(w * target_h / h / unit_image_size) * unit_image_size
-    else:
-        target_h = math.ceil(h / unit_image_size) * unit_image_size
-        target_w = math.ceil(w / unit_image_size) * unit_image_size
-    return x.resize((target_w, target_h))
-
-
-# ── Entry point ───────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import argparse
-    from glob import glob
-    from PIL import Image
-    import numpy as np
-    from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer
-    from transformer_sd3_dynamic import SD3Transformer2DModel
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint',  type=str,   default="/root/autodl-tmp/model.pt")
-    parser.add_argument('--image',       type=str,   default=None)
-    parser.add_argument('--prompt',      type=str,   default='a dog on the left and a cat on the right')
-    parser.add_argument('--cfg_prompt',  type=str,   default='')
-    parser.add_argument('--cfg_scale',   type=float, default=4.0)
-    parser.add_argument('--num_steps',   type=int,   default=50)
-    parser.add_argument('--height',      type=int,   default=512)
-    parser.add_argument('--width',       type=int,   default=512)
-    parser.add_argument('--seed',        type=int,   default=42)
-    parser.add_argument('--grid_size',   type=int,   default=2)
-    parser.add_argument('--output',      type=str,   default='output.jpg')
-    args = parser.parse_args()
-
-    SD3_PATH  = "Skywork/UniPic2-SD3.5M-Kontext-2B"
-    QWEN_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
-
-    PROMPT_TEMPLATE = dict(
-        IMG_START_TOKEN='<|vision_start|>',
-        IMG_END_TOKEN='<|vision_end|>',
-        IMG_CONTEXT_TOKEN='<|image_pad|>',
-        IMG_START_TOKEN_FOR_GENERATION=False,
-        SYSTEM='<|im_start|>system\n{system}<|im_end|>\n',
-        INSTRUCTION='<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n',
-        SUFFIX='<|im_end|>',
-        SUFFIX_AS_EOS=True,
-        SEP='\n',
-        STOP_WORDS=['<|im_end|>', '<|endoftext|>'],
-        GENERATION='Generate an image: {input}',
-        CFG='Generate an image.',
-    )
-
-    CONNECTOR_CFG = dict(
-        hidden_size=2048,
-        intermediate_size=11946,
-        num_hidden_layers=6,
-        _attn_implementation='flash_attention_2',
-        num_attention_heads=32,
-    )
-
-    print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        QWEN_PATH, trust_remote_code=True, padding_side='right')
-
-    print("Loading LMM...")
-    lmm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        QWEN_PATH, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-
-    print("Loading transformer...")
-    transformer = SD3Transformer2DModel.from_pretrained(
-        SD3_PATH, subfolder="transformer", torch_dtype=torch.bfloat16)
-
-    print("Loading scheduler...")
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        SD3_PATH, subfolder="scheduler")
-
-    print("Loading VAE...")
-    vae = AutoencoderKL.from_pretrained(
-        SD3_PATH, subfolder="vae", torch_dtype=torch.bfloat16)
-
-    print("Building model...")
-    model = Qwen2p5VLStableDiffusion3HF(
-        transformer=transformer,
-        train_scheduler=scheduler,
-        test_scheduler=scheduler,
-        vae=vae,
-        lmm=lmm,
-        tokenizer=tokenizer,
-        prompt_template=PROMPT_TEMPLATE,
-        connector=CONNECTOR_CFG,
-        num_queries=128,
-        freeze_lmm=True,
-        freeze_transformer=True,
-        use_activation_checkpointing=False,
-        pretrained_pth=None,
-    ).cuda().bfloat16().eval()
-
-    if args.checkpoint is not None:
-        print(f"Loading checkpoint: {args.checkpoint}", flush=True)
-        model.load_state_dict(guess_load_checkpoint(args.checkpoint), strict=False)
-
-    # ── Inference ─────────────────────────────────────────────────────
-    generator = torch.Generator(device=model.device).manual_seed(args.seed)
-    bsz       = args.grid_size ** 2
-    prompt     = [args.prompt]     * bsz
-    cfg_prompt = [args.cfg_prompt] * bsz
-
-    if args.image is not None:
-        paths      = sorted(glob(f"{args.image}/*")) if os.path.isdir(args.image) else [args.image]
-        ref_images = [Image.open(p).convert('RGB') for p in paths]
-        ref_images = [resize_image(img, max(args.width, args.height), 32) for img in ref_images]
-
-        width, height = ref_images[0].size if len(ref_images) == 1 else (args.width, args.height)
-
-        pixel_values_src = [
-            2 * (torch.from_numpy(np.array(img)).float() / 255) - 1
-            for img in ref_images]
-        pixel_values_src = [rearrange(t, 'h w c -> c h w') for t in pixel_values_src]
-        pixel_values_src = [pixel_values_src] * bsz
-    else:
-        width, height    = args.width, args.height
-        pixel_values_src = None
-
-    samples = model.generate(
-        prompt=prompt, cfg_prompt=cfg_prompt,
-        pixel_values_src=pixel_values_src,
-        cfg_scale=args.cfg_scale, num_steps=args.num_steps,
-        generator=generator, height=height, width=width)
-
-    samples = rearrange(samples, '(m n) c h w -> (m h) (n w) c', m=args.grid_size, n=args.grid_size)
-    samples = torch.clamp(127.5 * samples + 128.0, 0, 255).cpu().to(torch.uint8).numpy()
-    Image.fromarray(samples).save(args.output)
-    print(f"Saved → {args.output}")

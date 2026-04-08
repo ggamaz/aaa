@@ -21,8 +21,6 @@ from qwen2_5_sd3.transformer_sd3_dynamic import SD3Transformer2DModel
 from qwen2_5_sd3.qwen2_5_vl_sd3_hf_dynamic_fusion import Qwen2p5VLStableDiffusion3HF, guess_load_checkpoint
 
 
-from _datasets.utils import tiled_generate
-
 # ── 模型路径与配置常量 (请根据实际情况修改路径) ──
 SD3_PATH  = "pretrain_ckpts/UniPic2-SD3.5M-Kontext-2B"
 QWEN_PATH = "pretrain_ckpts/Qwen2.5-VL-3B-Instruct"
@@ -144,7 +142,7 @@ def _process_image(image, image_size=512):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="/root/aaa/runs/output/best_step_7000.pth")
+    parser.add_argument("--checkpoint", type=str, default="/root/aaa/runs/output/best_step_3000.pth")
     # parser.add_argument("--prompt", type=str, default='Fuse infrared and visible-light images to generate a naturally harmonious rainy street scene. Extract accurate positions and contours of thermal targets (pedestrians, vehicles) from the infrared image, but convert them to natural colors (warm yellow or orange tones) rather than directly overlaying highlights, avoiding overly abrupt thermal targets. Preserve clear details of building textures, shop sign texts, and road markings from the visible-light image while suppressing headlight scattering and rain-induced halos. Special attention: avoid blue-purple artifacts on the right-side vehicle, ensure license plate regions are not overexposed; keep pedestrian clothing colors natural without oversaturation due to thermal radiation. Adjust overall tone from cold blue to neutral-warm, maintaining rainy wetness while improving clarity, so the fusion result retains infrared detection advantages while possessing authentic visible-light visual experience.')
     parser.add_argument("--prompt", type=str, default='This is a natural, photorealistic fusion image based on visible light and infrared imagery. It aims to eliminate degradation artifacts in the input and restore realistic colors along with high-definition texture details. The image remains clean and natural, free of infrared artifacts, with all elements strictly aligned.')
     parser.add_argument("--src_imgs", type=str, nargs='+', default=['demo_dataset/input/ir/i00000.png',"demo_dataset/input/vi/v00000.png"], help="传入多张参考图的路径，用空格分隔")
