@@ -1,6 +1,5 @@
 import math
 
-from click import prompt
 import torch
 import numpy as np
 from einops import rearrange
@@ -13,18 +12,14 @@ import os
 import io
 import json
 import torch
-try:
-    from aoss_client.client import Client
-except:
-    try:
-        from petrel_client.client import Client
-    except:
-        Client = None
+
+Client = None
 from glob import glob
 from .utils import crop2square, resize_image_fix_pixels, resize_image_dynamic, paired_random_crop
 from einops import rearrange
 import numpy as np
-
+import random
+import torchvision.transforms.functional as TF
 
 class CaptionDataset(Dataset):
     def __init__(self,
@@ -279,69 +274,6 @@ class ImageEditDataset(CaptionDataset):
             print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
             return self._retry()
 
-
-
-class MultiImageEditDataset(CaptionDataset):
-    def _process_image(self, image):
-        assert self.image_process != 'crop2square'
-        return super()._process_image(image)['pixel_values']
-        # image = image.resize(size=(self.image_size, self.image_size))
-        # pixel_values = torch.from_numpy(np.array(image)).float()
-        # pixel_values = pixel_values / 255
-        # pixel_values = 2 * pixel_values - 1
-        # pixel_values = rearrange(pixel_values, 'h w c -> c h w')
-        # return pixel_values
-
-    def _process_text(self, text):
-        prompt_template = self.prompt_template
-        image_tokens = prompt_template['IMG_START_TOKEN'] + \
-                       prompt_template['IMG_CONTEXT_TOKEN'] * self.image_length + \
-                       prompt_template['IMG_END_TOKEN']
-        prompt = f'{image_tokens}\n{text}'
-        prompt = self.prompt_template['INSTRUCTION'].format(input=prompt)
-        if self.prompt_template.get('IMG_START_TOKEN_FOR_GENERATION', True):
-            prompt += prompt_template['IMG_START_TOKEN']
-        input_ids = self.tokenizer.encode(prompt, return_tensors='pt', **self.tokenizer_kwargs)[0]
-
-        return dict(input_ids=input_ids)
-
-    def __getitem__(self, idx):
-        if self.debug:
-            idx = 0
-        try:
-            data_sample = self.data_list[idx]
-            if self.image_folder is not None:
-                source_images = []
-                for img_path in data_sample['input_image']:
-                    img = Image.open(os.path.join(self.image_folder, img_path)).convert('RGB')
-                    source_images.append(img)
-                target_image = Image.open(os.path.join(self.image_folder, data_sample['output_image'])).convert('RGB')
-            else:
-                source_images =[]
-                for img_path in data_sample['input_image']:
-                    img = Image.open(img_path).convert('RGB')
-                    source_images.append(img)
-                target_image = Image.open(data_sample['output_image']).convert('RGB')
-
-            prompt = data_sample['instruction']
-
-            pixel_values_src = []
-            for img in source_images:
-                pixel_values_src.append(self._process_image(img))
-            pixel_values = self._process_image(target_image)
-
-            data = self._process_text(prompt) if self.tokenizer is not None else dict()
-
-            data.update(
-                pixel_values_src=pixel_values_src, pixel_values=pixel_values,
-                image_dir=self.image_folder,type='image2image', text=prompt)
-
-            return data
-
-        except Exception as e:
-            print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
-            return self._retry()
-
 class TwoImageEditDataset(ImageEditDataset):
     
     def _process_image_group(self, images):
@@ -386,6 +318,76 @@ class TwoImageEditDataset(ImageEditDataset):
                 pixel_values=target_pixel_values,
                 texts=[prompt_visual, prompt_downstream],
                 prompt_types=['visual', 'downstream']
+            )
+            
+        except Exception as e:
+            print(f"Error when reading {self.data_path}:{self.data_list[idx]}: {e}", flush=True)
+            return self._retry()
+
+class MaskImageEditDataset(ImageEditDataset):
+    
+    def _process_image_group(self, images):
+        w, h = images[0].size
+        if w < self.image_size or h < self.image_size:
+            ratio = max(self.image_size / w, self.image_size / h)
+            new_w, new_h = math.ceil(w * ratio), math.ceil(h * ratio)
+            images = [img.resize((new_w, new_h), Image.BILINEAR) for img in images]
+
+        max_retries = 5
+        
+        for _ in range(max_retries):
+            cropped_images = paired_random_crop(images, size=self.image_size)
+            mask_crop = cropped_images[3] 
+            
+            tiny_mask = mask_crop.resize((64, 64), Image.NEAREST)
+            mask_np = np.array(tiny_mask.convert('L'))
+            
+            fg_pixels = np.sum(mask_np > 127)
+            total_pixels = 64 * 64
+            fg_ratio = fg_pixels / total_pixels
+            
+            if fg_ratio > 0.01:
+                break 
+        pixel_values = torch.stack([TF.pil_to_tensor(img) for img in cropped_images]) 
+        pixel_values = pixel_values.float() / 255.0 * 2.0 - 1.0  # 归一化到 [-1, 1]，在 GPU 上执行
+        return pixel_values[0], pixel_values[1], pixel_values[2], pixel_values[3]
+
+    def __getitem__(self, idx):
+        if self.debug:
+            idx = 0
+        try:
+            data_sample = self.data_list[idx]
+            if self.image_folder is None:
+                self.image_folder = ""    
+                
+            # 1. 加载输入图像
+            visible_image = Image.open(os.path.join(self.image_folder, data_sample['input_v_image'])).convert('RGB')
+            infrared_image = Image.open(os.path.join(self.image_folder, data_sample['input_ir_image'])).convert('RGB')
+            
+            # 2. 加载视觉融合的目标图像
+            target_image = Image.open(os.path.join(self.image_folder, data_sample['output_image'])).convert('RGB')
+            
+            # 3. [新增] 加载下游分割任务的 Mask 图像
+            # 注意：即使 Mask 是单通道灰度图，也建议 .convert('RGB')。
+            # 因为 VAE 默认需要 3 通道输入，转成 RGB 后 [0, 0, 0] 和 [255, 255, 255] 依然是完美的二值边界。
+            mask_image = Image.open(os.path.join(self.image_folder, data_sample['output_mask'])).convert('RGB')
+
+            # 统一送入处理函数，保持空间对齐
+            visible_pv, infrared_pv, target_pv, mask_pv = self._process_image_group(
+                [visible_image, infrared_image, target_image, mask_image]
+            )
+
+            # 4. 读取我们在 JSON 中更新过的 Prompt 键名
+            prompt_visual = data_sample.get('instruction_fusion', 'Fuse the images to restore high quality details.')
+            prompt_segmentation = data_sample.get('instruction_segmentation', 'Segment the target object and output the mask.')
+            
+            # 5. 构建返回字典
+            return dict(
+                pixel_values_src=[visible_pv, infrared_pv],
+                pixel_values=target_pv,            # 视觉任务的目标图
+                pixel_masks=mask_pv,               # [新增] 分割任务的目标 Mask 图
+                texts=[prompt_visual, prompt_segmentation],
+                prompt_types=['visual', 'segmentation']  # [修改] 标签名对齐我们 Loss 函数里的逻辑
             )
             
         except Exception as e:

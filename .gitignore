@@ -208,7 +208,10 @@ __marimo__/
 
 runs
 COCO/**
-output/**
-pretrain_ckpts
+*output/**
+pretrain_ckpts/*
 *.json
 *.txt
+COCO
+tool_funcs
+perdict/**

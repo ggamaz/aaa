@@ -1,281 +1,240 @@
-from PIL import Image, ImageDraw, ImageFont
 import torch
-import textwrap
+from PIL import Image, ImageDraw, ImageFont
+
+from loguru import logger
+import sys
 import os
 
-import logging
-import sys
-import torch.distributed as dist
+def init_logger(output_dir, is_main_process=True, log_file_name="training.log"):
+    # 1. 移除默认配置（Loguru 默认会向终端输出）
+    logger.remove()
 
-# 全局 Logger 实例
-_logger = None
+    # 2. 配置终端输出：通过 filter 实现“按需输出”
+    # 我们定义一个特殊的信号叫做 "to_console"
+    logger.add(
+        sys.stderr, 
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:7}</level> | <level>{message}</level>",
+        filter=lambda record: record["extra"].get("show_in_console", True),
+        level="INFO" if is_main_process else "WARNING"
+    )
 
-def init_logger(output_dir, log_file_name="training.log"):
-    """
-    初始化全局 Logger。
-    - 主进程 (Rank 0) 会输出 INFO 级别的日志到控制台，并写入文件。
-    - 其他进程只会在发生 WARNING 或 ERROR 时输出，避免终端刷屏。
-    """
-    global _logger
-    
-    # 检查是否为 DDP 环境以及当前进程的 Rank
-    rank = int(os.environ.get('LOCAL_RANK', 0))
-    is_primary = (not dist.is_available()) or (not dist.is_initialized()) or rank == 0
-
-    _logger = logging.getLogger("DiffusersTrainer")
-    _logger.propagate = False # 防止重复打印
-    
-    # 主卡记录所有信息，副卡只记录警告和错误
-    _logger.setLevel(logging.INFO if is_primary else logging.WARNING)
-
-    # 如果已经初始化过，直接跳过 (防止重复添加 Handler)
-    if not _logger.handlers:
-        # 定义日志格式
-        formatter = logging.Formatter(
-            fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
+    # 3. 配置输出到文件（仅主进程）
+    if is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+        log_path = os.path.join(output_dir, log_file_name)
+        if os.path.exists(log_path):
+            base, ext = os.path.splitext(log_file_name)
+            idx = [f for f in os.listdir(output_dir) if f.startswith(base) and f.endswith(ext)]
+            log_path = os.path.join(output_dir, f"{base}_{len(idx)}{ext}")
+        logger.add(
+            log_path, 
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level:7} | {message}",
+            level="INFO",
+            enqueue=True  # 异步且多进程安全
         )
-        
-        # 1. 控制台 Handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        _logger.addHandler(console_handler)
-        
-        # 2. 文件 Handler (仅主卡写入文件，防止多进程写同一文件冲突)
-        if is_primary:
-            os.makedirs(output_dir, exist_ok=True)
-            log_path = os.path.join(output_dir, log_file_name)
-            file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
-            file_handler.setFormatter(formatter)
-            _logger.addHandler(file_handler)
 
-def print_log(msg, level="info"):
+def print_log(msg, level="info", show_in_console=True):
     """
-    向后兼容的日志打印函数。
-    直接替换原来的 print_log，使用方式完全不变。
+    使用 bind 动态传递变量给 filter
     """
-    if _logger is None:
-        # 兜底方案：如果忘记调用 init_logger，退化为普通带刷新的 print
-        print(msg, flush=True)
-        return
+    # .bind() 会把变量放入 record["extra"] 中，触发上面定义的 filter 逻辑
+    log_method = getattr(logger.bind(show_in_console=show_in_console), level.lower(), logger.info)
+    log_method(msg)
+
+def print_gpu_mem(tag):
+    allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+    cached = torch.cuda.memory_reserved() / 1024**3
+    print_log(f"[{tag}] Allocated: {allocated:.1f}G, Cached: {cached:.1f}G")
+
+def log_model_parameters(raw_model, is_main_process=True):
+    """统计模型参数，按模块/类别分类显示可训练参数数量。"""
+    trainable_params = []
+    module_param_counts = {}
+    total_trainable = 0
+    total_params = 0
+
+    for name, param in raw_model.named_parameters():
+        num_params = param.numel()
+        total_params += num_params
         
-    # 获取对应的日志级别方法 (info, warning, error)
-    log_method = getattr(_logger, level.lower(), _logger.info)
-    log_method(str(msg))
+        if param.requires_grad:
+            trainable_params.append(param)
+            total_trainable += num_params
+            
+            top_level_module = name.split('.')[0] if '.' in name else name
+            category = f"{top_level_module} (LoRA)" if 'lora' in name.lower() else top_level_module
+            module_param_counts[category] = module_param_counts.get(category, 0) + num_params
+
+    if is_main_process:
+        print_log("=" * 60)
+        print_log(f"{'Module / Category':<30} | {'Trainable Params (M)':<25}")
+        print_log("-" * 60)
+        for mod, count in sorted(module_param_counts.items(), key=lambda x: x[1], reverse=True):
+            print_log(f"{mod:<30} | {count / 1e6:>20.4f} M")
+        print_log("-" * 60)
+        print_log(f"{'Total Trainable':<30} | {total_trainable / 1e6:>20.4f} M")
+        print_log(f"{'Total Parameters':<30} | {total_params / 1e6:>20.4f} M")
+        print_log(f"{'Trainable Ratio':<30} | {total_trainable / total_params * 100:>20.4f} %")
+        print_log("=" * 60)
+        
+    return trainable_params
+
 
 # ── Visualization Helper ──────────────────────────────────────────────
-@torch.no_grad()
-def log_training_images_oneline(model, batch, step, output_dir, image_size=512):
+
+import os
+import textwrap
+import torch
+from PIL import Image, ImageDraw, ImageFont
+
+# --- 辅助函数 ---
+def tensor_to_pil(tensor):
     """
-    提取当前 batch 的第一个样本，将其对应的文本渲染成图像，并与输入参考图、生成的图像横向拼接。
-    保持输入图像的真实比例，避免强制拉伸。
+    将 PyTorch Tensor 转换为 PIL Image。
+    注意：输入 Tensor 的 shape 应为 [C, H, W]，如果原来是 [N, C, H, W]，需要在外部遍历。
     """
-    model.eval()
+    np_img = torch.clamp(127.5 * tensor.cpu().float() + 128.0, 0, 255).byte().permute(1, 2, 0).numpy()
+    return Image.fromarray(np_img)
+
+
+# --- 核心函数 1：排版与保存 ---
+def save_visualization_grid(
+    pil_refs, gt_visual_pil, gt_mask_pil, gen_imgs, 
+    sample_texts, sample_types, ref_w, ref_h, 
+    step, sample_idx, output_dir
+):
+    """
+    负责将生成的图像、参考图、文本和 GT 图像进行网格排版，并保存到本地。
+    """
     
-    try:
-        text = batch['texts'][0]
-        refs = batch['pixel_values_src'][0] # 这是第一条数据的参考图列表 (元素为 [C, H, W] 的 Tensor)
-        
-        # 【修复核心 1】动态获取输入图像的真实高宽
-        ref_h, ref_w = refs[0].shape[1], refs[0].shape[2]
-        
-        # 1. 绘制文本 Prompt 图像，高度与参考图一致，宽度固定为 image_size
-        prompt_img = Image.new('RGB', (image_size, ref_h), color=(255, 255, 255))
-        draw = ImageDraw.Draw(prompt_img)
-        wrapped_text = "\n".join(textwrap.wrap(text, width=45))
-        
+    # 辅助绘图函数：文本转图像
+    def draw_text_image(text_content, prefix="Prompt"):
+        img = Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        wrap_width = max(20, ref_w // 12) 
+        wrapped_text = "\n".join(textwrap.wrap(f"[{prefix}]\n{text_content}", width=wrap_width))
         try:
             font = ImageFont.load_default(size=18)
         except TypeError:
             font = ImageFont.load_default()
-            
         draw.text((20, 20), wrapped_text, fill=(0, 0, 0), font=font, spacing=8)
-        
-        # 2. 获取两张输入图像
-        pil_refs = []
-        for ref_tensor in refs:
-            # ref_tensor 是 [C, H, W] 范围 [-1, 1]，转回 PIL
-            ref_np = torch.clamp(127.5 * ref_tensor.cpu() + 128.0, 0, 255).byte().permute(1, 2, 0).numpy()
-            # 【修复核心 2】取消强行的 .resize((image_size, image_size))，保持真实形状
-            img = Image.fromarray(ref_np)
-            pil_refs.append(img)
-            
-        while len(pil_refs) < 2:
-            # 补充的白底图也使用真实的参考图尺寸
-            pil_refs.append(Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255)))
-            
-        # 3. 生成输出图像
-        gen_out = model.generate(
-            prompt=[text],
-            cfg_prompt=['blurry, low quality, low resolution, distorted, deformed, broken content, missing parts, damaged details, artifacts, glitch, noise, pixelated, grainy, compression artifacts, bad composition, wrong proportion, incomplete editing, unfinished, unedited areas.'],
-            pixel_values_src=[refs], 
-            cfg_scale=4.5,
-            num_steps=20,
-            # 【修复核心 3】生成时强制使用输入图像的真实宽高
-            height=ref_h,
-            width=ref_w,
-            progress_bar=False
-        )
-        # gen_out 形状: [1, C, H, W]
-        gen_tensor = gen_out[0].cpu()
-        gen_np = torch.clamp(127.5 * gen_tensor + 128.0, 0, 255).byte().permute(1, 2, 0).numpy()
-        gen_img = Image.fromarray(gen_np)
-        
-        # 4. 拼接图像: Prompt -> Ref 1 -> Ref 2 -> Generated
-        images_to_concat = [prompt_img, pil_refs[0], pil_refs[1], gen_img]
-        
-        total_width = sum(img.size[0] for img in images_to_concat)
-        max_height = max(img.size[1] for img in images_to_concat) # 正常情况下大家高度都是 ref_h
-        
+        return img
+
+    # 辅助拼接函数：横向拼接一行
+    def concat_row(images_list):
+        total_width = sum(img.size[0] for img in images_list)
+        max_height = max(img.size[1] for img in images_list)
         concat_img = Image.new('RGB', (total_width, max_height))
         x_offset = 0
-        for img in images_to_concat:
+        for img in images_list:
             concat_img.paste(img, (x_offset, 0))
             x_offset += img.size[0]
-            
-        # 保存图片
-        sample_dir = os.path.join(output_dir, "samples")
-        os.makedirs(sample_dir, exist_ok=True)
-        save_path = os.path.join(sample_dir, f"step_{step:06d}.jpg")
-        concat_img.save(save_path)
-        
-    except Exception as e:
-        print_log(f"Visualization failed at step {step}: {e}")
-        
-    finally:
-        model.train() # 恢复到训练模式
+        return concat_img
 
+    blank_img = Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255))
+    
+    # 动态组装网格行
+    # 第一行：通常放置参考图 (可见光, 红外等)，最后补一个空白占位对齐 GT 列
+    first_row_imgs = pil_refs[:2] if len(pil_refs) >= 2 else pil_refs + [blank_img] * (2 - len(pil_refs))
+    first_row_imgs.append(blank_img)
+    rows = [concat_row(first_row_imgs)]
+
+    # 后续行：遍历每个任务
+    for p_type, p_text, g_img in zip(sample_types, sample_texts, gen_imgs):
+        display_type = str(p_type).capitalize() if p_type else "Unknown Task"
+        
+        # 根据任务类型匹配 GT 图
+        if p_type == 'visual':
+            gt_img = gt_visual_pil
+        elif p_type in ('segmentation', 'downstream'):
+            gt_img = gt_mask_pil
+        else:
+            gt_img = blank_img
+            
+        # 每一行三列结构：文本描述 | 模型生成图 | GT 目标图
+        row_imgs = [draw_text_image(p_text, display_type), g_img, gt_img]
+        rows.append(concat_row(row_imgs))
+        
+    # 纵向拼接所有行
+    total_height = sum(r.size[1] for r in rows)
+    max_width = max(r.size[0] for r in rows)
+    
+    final_img = Image.new('RGB', (max_width, total_height))
+    y_offset = 0
+    for r in rows:
+        final_img.paste(r, (0, y_offset))
+        y_offset += r.size[1]
+        
+    # 执行保存
+    sample_dir = os.path.join(output_dir, "samples")
+    os.makedirs(sample_dir, exist_ok=True)
+    if sample_idx is not None:
+        save_path = os.path.join(sample_dir, f"step_{step:06d}_{sample_idx:04d}.jpg")
+    else:
+        save_path = os.path.join(sample_dir, f"step_{step:06d}.jpg")
+    final_img.save(save_path)
+    # print(f"Saved visualization: {save_path}") # 可选：打印保存路径
 
 @torch.no_grad()
-def log_training_images_threeline(model, batch, step, output_dir, image_size=512):
+def log_training_images_dynamic(model, batch, step, output_dir):
     """
-    提取当前 batch 的第一个样本，生成视觉融合与下游任务融合的图像。
-    排版格式：
-    Row 1: [Ref 1 (VI)]        [Ref 2 (IR)]
-    Row 2: [Prompt Visual]     [Gen Visual]
-    Row 3: [Prompt Downstream] [Gen Downstream]
+    接受原始 batch 数据，调用模型推理生成图像，然后将数据打包交给排版函数进行保存。
     """
     model.eval()
-    
-    try:
-        # 1. 动态解析两种 Prompt (适配最新的 Dataset 多任务结构)
-        sample_texts = batch['texts'][0]
-        sample_types = batch['prompt_types'][0]
-        
-        text_visual = None
-        text_downstream = None
-        
-        if 'visual' in sample_types:
-            text_visual = sample_texts[sample_types.index('visual')]
-        if 'downstream' in sample_types:
-            text_downstream = sample_texts[sample_types.index('downstream')]
-            
-        # 兜底：如果没找到 visual，强制取第一个 prompt 防止崩溃
-        if text_visual is None:
-            text_visual = sample_texts[0]
-            
-        has_downstream = text_downstream is not None
+    # 将字典数据按样本打包，方便遍历
+    batch_iterator = zip(
+        batch['texts'], 
+        batch['prompt_types'], 
+        batch['pixel_values_src'], 
+        batch['pixel_values'], 
+        batch['pixel_masks']
+    )
+    BSZ = batch['texts'].shape[0] if isinstance(batch['texts'], torch.Tensor) else len(batch['texts'])
+    for i, (texts, prompt_types, refs_tensor, gt_visual, gt_mask) in enumerate(batch_iterator):
+        if not texts:
+            print(f"Skipping visualization for sample {i} at step {step}: No prompts found.")
+            continue
 
-        # 2. 获取输入参考图 (VI 和 IR)
-        refs = batch['pixel_values_src'][0] 
-        ref_h, ref_w = refs[0].shape[1], refs[0].shape[2]
+        # 提取空间维度
+        _, _, ref_h, ref_w = refs_tensor.shape
         
-        # 将 Tensor 转回 PIL 图像
-        pil_refs = []
-        for ref_tensor in refs:
-            ref_np = torch.clamp(127.5 * ref_tensor.cpu() + 128.0, 0, 255).byte().permute(1, 2, 0).numpy()
-            pil_refs.append(Image.fromarray(ref_np))
-            
-        while len(pil_refs) < 2:
-            pil_refs.append(Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255)))
+        # 将参考图和 GT 转为 PIL
+        pil_refs = [tensor_to_pil(ref) for ref in refs_tensor]
+        gt_visual_pil = tensor_to_pil(gt_visual)
+        gt_mask_pil = tensor_to_pil(gt_mask)
 
-        # 3. 构造批量生成的输入 (同时推断 Visual 和 Downstream)
-        prompts_to_gen = [text_visual]
-        refs_to_gen = [refs]
-        
-        if has_downstream:
-            prompts_to_gen.append(text_downstream)
-            refs_to_gen.append(refs) # 将同一组参考图喂给第二个 Prompt
+        # 准备生成参数
+        num_prompts = len(texts)
+        NEGATIVE_PROMPT = 'blurry, low quality, low resolution, distorted, deformed, broken content, missing parts, damaged details, artifacts, glitch, noise, pixelated, grainy, compression artifacts, bad composition, wrong proportion, incomplete editing, unfinished, unedited areas.'
+        cfg_prompts = [NEGATIVE_PROMPT] * num_prompts
+        refs_to_gen = refs_tensor.unsqueeze(0).expand(num_prompts, -1, -1, -1, -1)
 
-        # 统一的负面提示词
-        cfg_prompts = ['blurry, low quality, low resolution, distorted, deformed, artifacts, noise'] * len(prompts_to_gen)
+        # 执行推理
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            gen_outs = model.generate(
+                prompt=texts,
+                cfg_prompt=cfg_prompts,
+                pixel_values_src=refs_to_gen, 
+                cfg_scale=4.5,
+                num_steps=20,
+                height=ref_h,
+                width=ref_w,
+                progress_bar=False
+            )
 
-        # 4. 生成图像 (Batch Size = 1 或 2)
-        gen_outs = model.generate(
-            prompt=prompts_to_gen,
-            cfg_prompt=cfg_prompts,
-            pixel_values_src=refs_to_gen, 
-            cfg_scale=4.5,
-            num_steps=20,
-            height=ref_h,
-            width=ref_w,
-            progress_bar=False
+        # 保存结果 (注意传入的文件名可能需要区分 batch 里的不同样本)
+        save_visualization_grid(
+            pil_refs=pil_refs,
+            gt_visual_pil=gt_visual_pil,
+            gt_mask_pil=gt_mask_pil,
+            gen_imgs=[tensor_to_pil(img) for img in gen_outs],
+            sample_texts=texts,
+            sample_types=prompt_types,
+            ref_w=ref_w,
+            ref_h=ref_h,
+            step=step,
+            sample_idx=i if BSZ > 1 else None, # 建议传入索引，防止覆盖
+            output_dir=output_dir
         )
-
-        gen_imgs = []
-        for gen_tensor in gen_outs:
-            gen_np = torch.clamp(127.5 * gen_tensor.cpu() + 128.0, 0, 255).byte().permute(1, 2, 0).numpy()
-            gen_imgs.append(Image.fromarray(gen_np))
-
-        # 5. 辅助函数：绘制包含文字的 PIL 图像 (宽度设为 ref_w 以对齐两列网格)
-        def draw_text_image(text_content, prefix="Prompt"):
-            img = Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255))
-            draw = ImageDraw.Draw(img)
-            # 根据图像宽度动态调整换行字符数，粗略按每个字符 8-10 像素计算
-            wrap_width = max(20, ref_w // 12) 
-            wrapped_text = "\n".join(textwrap.wrap(f"[{prefix}]\n{text_content}", width=wrap_width))
-            try:
-                font = ImageFont.load_default(size=18)
-            except TypeError:
-                font = ImageFont.load_default()
-            draw.text((20, 20), wrapped_text, fill=(0, 0, 0), font=font, spacing=8)
-            return img
-
-        # 辅助函数：拼接单行图像
-        def concat_row(images_list):
-            total_width = sum(img.size[0] for img in images_list)
-            max_height = max(img.size[1] for img in images_list)
-            concat_img = Image.new('RGB', (total_width, max_height))
-            x_offset = 0
-            for img in images_list:
-                concat_img.paste(img, (x_offset, 0))
-                x_offset += img.size[0]
-            return concat_img
-
-        # 6. 组装网格行
-        rows = []
         
-        # 第一行：Ref 1 -> Ref 2
-        row1_imgs = [pil_refs[0], pil_refs[1]]
-        rows.append(concat_row(row1_imgs))
-
-        # 第二行：Prompt Visual -> Gen Visual
-        row2_imgs = [draw_text_image(text_visual, "Visual"), gen_imgs[0]]
-        rows.append(concat_row(row2_imgs))
-
-        # 第三行：Prompt Downstream -> Gen Downstream (如果存在)
-        if has_downstream and len(gen_imgs) > 1:
-            row3_imgs = [draw_text_image(text_downstream, "Downstream"), gen_imgs[1]]
-            rows.append(concat_row(row3_imgs))
-            
-        # 纵向拼接所有行
-        total_height = sum(r.size[1] for r in rows)
-        max_width = max(r.size[0] for r in rows)
-        
-        final_img = Image.new('RGB', (max_width, total_height))
-        y_offset = 0
-        for r in rows:
-            final_img.paste(r, (0, y_offset))
-            y_offset += r.size[1]
-            
-        # 7. 保存图片
-        sample_dir = os.path.join(output_dir, "samples")
-        os.makedirs(sample_dir, exist_ok=True)
-        save_path = os.path.join(sample_dir, f"step_{step:06d}.jpg")
-        final_img.save(save_path)
-        
-    except Exception as e:
-        print(f"Visualization failed at step {step}: {e}")
-        
-    finally:
-        model.train()
+    model.train()
