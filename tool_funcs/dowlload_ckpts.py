@@ -35,7 +35,7 @@ if __name__ == "__main__":
     tasks = [
         {
             "model_id": "Skywork/UniPic2-SD3.5M-Kontext-2B",
-            "save_dir": "./pretrain_ckpts/UniPic2-SD3.5M-Kontext-2B",
+            "save_dir": "./ckpts/UniPic2-SD3.5M-Kontext-2B",
             "allow": ["config.json",
                       "model_index.json",
                       "vae/*.json", "vae/*.safetensors",
@@ -46,13 +46,13 @@ if __name__ == "__main__":
         },
         {
             "model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
-            "save_dir": "./pretrain_ckpts/Qwen2.5-VL-3B-Instruct",
+            "save_dir": "./ckpts/Qwen2.5-VL-3B-Instruct",
             "allow": ["*.json", "*.safetensors"],
             "ignore": ["*.bin", "*.png"]
         },
         {
             "model_id": "deepgenteam/DeepGen-1.0",
-            "save_dir": "./pretrain_ckpts",
+            "save_dir": "./ckpts",
             "allow": ["model.pt"]
         }
     ]

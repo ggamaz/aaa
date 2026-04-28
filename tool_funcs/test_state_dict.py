@@ -27,9 +27,9 @@ def save_pth_keys(pth_path, output_path):
 
 # ================= 配置区域 =================
 # 请将下面的路径修改为你实际的文件路径
-# input_pth_file = 'pretrain_ckpts/model.pt'    # 你的 .pth 文件路径
+# input_pth_file = 'ckpts/model.pt'    # 你的 .pth 文件路径
 # output_txt_file = "origin_model_keys.txt"  
-# input_pth_file = "pretrain_ckpts/merged_model.pt"
+# input_pth_file = "ckpts/merged_model.pt"
 # output_txt_file = 'merged_model_keys.txt'     # 保存结果的文本文件路径
 input_pth_file = "temp_merged.pth"
 output_txt_file = 'temp_merged_model_keys.txt'     # 保存结果的文本文件路径

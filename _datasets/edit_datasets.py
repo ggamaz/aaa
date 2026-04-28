@@ -7,19 +7,14 @@ from PIL import Image
 import os
 
 from torch.utils.data import Dataset
-from PIL import Image
-import os
 import io
 import json
-import torch
 
-Client = None
 from glob import glob
 from .utils import crop2square, resize_image_fix_pixels, resize_image_dynamic, paired_random_crop
-from einops import rearrange
-import numpy as np
 import random
 import torchvision.transforms.functional as TF
+Client = None
 
 class CaptionDataset(Dataset):
     def __init__(self,

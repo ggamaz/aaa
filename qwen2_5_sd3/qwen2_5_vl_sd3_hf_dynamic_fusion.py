@@ -1,10 +1,8 @@
-import os
 import random
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.nn.modules.module import T
 from functools import partial
 from einops import rearrange
@@ -17,17 +15,15 @@ from qwen2_5_sd3.modeling_connector import ConnectorConfig, ConnectorEncoder
 from qwen2_5_sd3.pipeline_stable_diffusion_3_dynamic import (
     StableDiffusion3Pipeline, calculate_shift,
 )    
-import torch.nn.functional as F
 from contextlib import contextmanager
-
+import lpips
+import warnings
 # ─────────────────────────────────────────────────────────────────────
 #  Utilities
 # ─────────────────────────────────────────────────────────────────────
 
 IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 IMAGE_STD  = (0.26862954, 0.26130258, 0.27577711)
-
-
 
 def guess_load_checkpoint(pth):
     checkpoint = torch.load(pth, map_location='cpu')
@@ -87,6 +83,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                  vit_input_size=448,
                  max_length=1024,
                  freeze_lmm=True,
+                 freeze_connector=False,
                  freeze_mq=False,
                  res_vit=False,
                  pretrained_pth=None,
@@ -98,6 +95,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                  weighting_scheme='none',
                  logit_mean=0.0,
                  logit_std=1.0,
+                 mode="train"
                  ):
         super().__init__()
 
@@ -120,6 +118,16 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         print_log("Setting up VAE ...")
         self.vae = vae
         self.vae.requires_grad_(False)
+
+        # ── LPIPS ─────────────────────────────────────────────────────
+        if mode == 'train':
+            print_log("Setting up LPIPS ...")
+            # 推荐使用 VGG，感知效果最好。设为 eval 且无需梯度
+            with warnings.catch_warnings():
+                # Suppress warnings from lpips
+                warnings.simplefilter("ignore")
+                self.lpips_model = lpips.LPIPS(net='vgg', verbose=False).to(device=self.device)
+                self.lpips_model.eval().requires_grad_(False)
 
         # ── Misc ──────────────────────────────────────────────────────
         self.res_vit               = res_vit
@@ -167,11 +175,15 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                 print_log(f"Unexpected keys: {unexpected}")
 
         # ── Freeze meta-queries and projectors if specified ─────────────────
-        print_log(f"freeze_meta_query={freeze_mq}")
-        self.freeze_mq = freeze_mq
-        if freeze_mq:
+        self.freeze_connector = freeze_connector
+        if freeze_connector:
+            print_log("freeze_connector")
             for m in (self.projector_1, self.projector_2, self.projector_3, self.connector):
                 m.requires_grad_(False)
+        
+        self.freeze_mq = freeze_mq
+        if freeze_mq:
+            print_log("freeze_meta_query")
             self.meta_queries.requires_grad_(False)
 
         # ── Activation checkpointing ──────────────────────────────────
@@ -183,7 +195,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         if lora_modules is not None:
             assert self.freeze_lmm, "LoRA requires freeze_lmm=True"
             print_log("Applying LoRA to LMM ...")
-            self.llm.config.tie_word_embeddings = False
+            self.llm.config.tie_word_embeddings = True
             if lora_modules == 'auto':
                 lora_modules = find_target_linear_names(self.lmm)
             self.lmm.add_adapter(
@@ -213,6 +225,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         else:
             print_log("freeze_transformer=False: DiT full fine-tune.")
 
+        self.truncat_warning = True
         self._infer_pipeline = None
     
     def _get_pipeline(self):
@@ -255,6 +268,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             self.lmm.to(lmm_device)
             self.connector.to(connector_device)
             torch.cuda.empty_cache()
+
     # ── Properties ───────────────────────────────────────────────────
     @property
     def llm(self):
@@ -324,6 +338,43 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
 
         return {k: v for k, v in sd.items() if _keep(k)}
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        与 state_dict() 的过滤逻辑对称：
+        - vae.* / ema.*                          → 永远不保存，允许缺失
+        - lmm.*(非LoRA) 且 freeze_lmm=True      → 不保存，允许缺失
+        - transformer.*(非LoRA) 且 freeze_tf=True → 不保存，允许缺失
+        其余 key（connector / projector / meta_queries / LoRA）必须存在。
+        """
+        missing, unexpected = super().load_state_dict(state_dict, strict=False)
+
+        if strict:
+            def _should_be_present(k):
+                kl = k.lower()
+                # LoRA 权重必须存在
+                if any(kw in kl for kw in self._LORA_KEYWORDS):
+                    return True
+                # 跳过的模块本来就不保存
+                if any(k.startswith(p) for p in self._SKIP_PREFIXES):
+                    return False
+                # 冻结的 lmm 基础权重不保存
+                if k.startswith('lmm.') and self.freeze_lmm:
+                    return False
+                # 冻结的 transformer 基础权重不保存
+                if k.startswith('transformer.') and self.freeze_transformer:
+                    return False
+                return True
+
+            real_missing = [k for k in missing if _should_be_present(k)]
+            if real_missing or unexpected:
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict for {type(self).__name__}:\n"
+                    f"  Missing key(s): {real_missing}\n"
+                    f"  Unexpected key(s): {unexpected}"
+                )
+
+        return missing, unexpected
+
     # ── Core projection ───────────────────────────────────────────────
 
     def llm2dit(self, x):
@@ -341,7 +392,6 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         z = self.vae.encode(pixels).latent_dist.sample()
         return (z - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
-    @torch.no_grad()
     def batch_latents_to_pixels(self, z: torch.Tensor):
         assert len(z.shape) == 4, "Expected latent tensor of shape (B, C, H', W')"
         z = z / self.vae.config.scaling_factor + self.vae.config.shift_factor
@@ -415,6 +465,15 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
 
     def _truncate_inputs(self, inputs, max_len):
         out = {}
+        if 'inputs_embeds' in inputs:
+            actual_len = inputs['inputs_embeds'].shape[1]
+            if actual_len >= max_len:
+                # 记录截断情况
+                print_log(f"⚠️ [警告] 发生截断！当前序列总长 {actual_len} > 允许的最大长度 {max_len}。")
+                print_log(f"--- 丢失了最左侧的 {actual_len - max_len} 个 Token，可能会影响图像上下文或早期指令。")
+            elif self.truncat_warning:
+                print_log(f"✅ 当前序列总长 {actual_len} 在{max_len}内，无需截断。")
+                self.truncat_warning = False  # 只打印一次警告
         for k, v in inputs.items():
             if k == 'inputs_embeds':
                 out[k] = v[:, -max_len:, :]
@@ -437,12 +496,10 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
 
     @torch.no_grad()
     def get_semantic_features(self, pixel_values, resize=True):
-        if not hasattr(self, '_vit_mean'):
-            self._vit_mean = self.vit_mean.to(device=self.device, dtype=self.dtype)
-            self._vit_std = self.vit_std.to(device=self.device, dtype=self.dtype)
-
+        vit_mean = self.vit_mean.to(device=self.device, dtype=self.dtype)
+        vit_std  = self.vit_std.to(device=self.device, dtype=self.dtype)
         pixel_values = (pixel_values + 1.0) / 2
-        pixel_values = (pixel_values - self._vit_mean) / self._vit_std
+        pixel_values = (pixel_values - vit_mean) / vit_std
 
         if resize:
             pixel_values = F.interpolate(
@@ -503,9 +560,9 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                 if isinstance(lens, int):
                     lens = [lens]
                 tokens = ""
-                for l in lens:
+                for l_ in lens:
                     tokens += (self.prompt_template['IMG_START_TOKEN'] + 
-                               self.prompt_template['IMG_CONTEXT_TOKEN'] * l + 
+                               self.prompt_template['IMG_CONTEXT_TOKEN'] * l_ + 
                                self.prompt_template['IMG_END_TOKEN'])
                 prompts.append(self.prompt_template['INSTRUCTION'].format(input=f'{tokens}\n{text}'))
                 
@@ -556,31 +613,30 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         inputs = self._truncate_inputs(inputs, max_len)
 
         pooled_out, seq_out = self._llm_forward_and_merge(inputs)
-        return self.diff_loss(image_latents, pooled_out, seq_out)
+        
+        batch_base_loss = self.compute_diff_loss(image_latents, pooled_out, seq_out)
+        return batch_base_loss
 
-    def image2image_loss(self, data_dict):
-        # 1. 这里的 Tensor 已经由 Accelerate 异步传到了 GPU，并且是 bfloat16
+    def image2image_loss(self, data_dict, soar_lambda=1.0, pixel_lambda=1.0, return_dict=False):
         pixel_values_src = data_dict['pixel_values_src']
         b, n, c, h, w = pixel_values_src.shape
-
-        # 2. 目标图像处理 -> (B, C_l, H_l, W_l)
+        # target pixel2latent
         image_latents = self.batch_pixels_to_latents(data_dict['pixel_values'])
-
-        # 3. 将参考图像展平，让 VAE 和 LMM 一次性吃满 GPU 并行度
         flat_src_tensor = pixel_values_src.view(b * n, c, h, w)
-        
-        # [全 Batch VAE] 
+        # condition pixel2latent
         flat_src_latents = self.batch_pixels_to_latents(flat_src_tensor)
         image_latents_src = flat_src_latents.view(b, n, *flat_src_latents.shape[1:])
         
-        # [全 Batch LMM 特征] 
         image_embeds, image_grid_thw = self.get_semantic_features_dynamic(flat_src_tensor)
         seq_len = image_embeds.shape[1]
 
-        # 4. 准备 Prompt (字符串处理是 CPU 任务，这里保留 .to(device))
         num_refs = [n] * b
-        text_inputs = self.prepare_image2image_prompts(
-            data_dict['texts'], num_refs=num_refs, seq_len=seq_len)
+        # 10% 的概率将任务控制文本替换为CFG prompt
+        texts = [
+            self.prompt_template['CFG'] if random.random() < self.unconditional else t 
+            for t in data_dict['texts']
+        ]
+        text_inputs = self.prepare_image2image_prompts(texts, num_refs=num_refs, seq_len=seq_len)
         
         query_emb = self.meta_queries[None].expand(b, -1, -1)
         
@@ -594,11 +650,72 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
         max_len = self.max_length + n * seq_len + self.num_queries
         inputs = self._truncate_inputs(inputs, max_len)
 
-        # 5. LLM 与 DiT 计算 Loss
+        # LLM 与 DiT 计算 Loss
         pooled_out, seq_out = self._llm_forward_and_merge(inputs)
         
-        return self.diff_loss(
-            image_latents, pooled_out, seq_out, cond_input=image_latents_src)
+        # ── 调度中心：依次调用解耦模块 ───────────────────────────────────────
+        
+        # [A] 基础 Flow Matching 计算
+        batch_base_loss, model_pred, noisy_input, sigmas, noise, timesteps = self.compute_diff_loss(
+            image_latents, pooled_out, seq_out, cond_input=image_latents_src, return_internal=True
+        )
+        total_batch_loss = batch_base_loss.clone()
+
+        # 提前初始化，防止对应开关关闭时引发 UnboundLocalError
+        soar_loss = 0.0
+        pixel_loss = 0.0
+
+        # [B] SOAR 损失叠加 (按需触发)
+        if soar_lambda > 0:
+            soar_N = 1
+            
+            with torch.no_grad():
+                # 构造全是无条件指令的 Batch
+                uncond_texts = [self.prompt_template['CFG']] * b
+                text_inputs_uncond = self.prepare_image2image_prompts(
+                    uncond_texts, num_refs=num_refs, seq_len=seq_len)
+                
+                inputs_uncond = self.prepare_forward_input(
+                    query_embeds=query_emb,
+                    image_embeds=image_embeds,      # 源图像特征保持不变！
+                    image_grid_thw=image_grid_thw,  
+                    **text_inputs_uncond)
+                inputs_uncond = self._truncate_inputs(inputs_uncond, max_len)
+                
+                # 获取合法的无条件投影特征
+                uncond_pooled_out, uncond_seq_out = self._llm_forward_and_merge(inputs_uncond)
+            # ----------------------------------------
+            soar_loss = self.compute_soar_loss(
+                image_latents, noisy_input, model_pred, sigmas, noise, timesteps,
+                pooled_out, seq_out,
+                uncond_pooled_embeds=uncond_pooled_out,
+                uncond_prompt_embeds=uncond_seq_out,
+                cond_input=image_latents_src, soar_N=soar_N
+            )
+            total_batch_loss = (total_batch_loss + soar_lambda * soar_loss) / (1.0 + soar_lambda * soar_N)
+
+        # [C] 像素级结构损失叠加 (按需触发)
+        if pixel_lambda > 0:
+            pixel_values = data_dict.get('pixel_values')
+            if isinstance(pixel_values, list):
+                pixel_values = torch.stack(pixel_values)
+            pixel_loss = self.compute_pixel_loss(noisy_input, model_pred, sigmas, pixel_values)
+            total_batch_loss += pixel_lambda * pixel_loss
+
+        # ---------------- 精准修改：返回标量并做 Detach 处理 ----------------
+        if return_dict:
+            # 辅助函数：统一转换为剥离计算图的均值标量，防止外层误算梯度
+            def _to_scalar(v):
+                return v.mean().detach() if isinstance(v, torch.Tensor) else v
+
+            return {
+                'loss': total_batch_loss.mean(), # 只有这个主 Loss 保留梯度计算图
+                'loss_diff_log': _to_scalar(batch_base_loss),
+                'loss_soar_log': _to_scalar(soar_loss),
+                'loss_pixel_log': _to_scalar(pixel_loss)
+            }
+        return total_batch_loss.mean()
+        
 
     @staticmethod
     def _select_texts_for_task(texts_batch, prompt_types_batch, task):
@@ -619,20 +736,188 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             task = 'segmentation' if curr_step % 2 == 0 else 'visual'
         else:
             task  = random.choice(['visual', 'segmentation'])
-        texts = self._select_texts_for_task(data_dict['texts'], data_dict['prompt_types'], task)
 
+        texts = self._select_texts_for_task(data_dict['texts'], data_dict['prompt_types'], task)
         task_dict = {
             'pixel_values_src': data_dict['pixel_values_src'],
             'texts': texts,
-            'pixel_values': (
-                data_dict.get('pixel_masks', data_dict['pixel_values'])
-                if task == 'segmentation' else data_dict['pixel_values']),
+            'pixel_values': (data_dict['pixel_masks'] if task == 'segmentation' else data_dict['pixel_values']),
         }
 
-        key = 'loss_visual' if task == 'visual' else 'loss_segmentation'
-        loss_dict = {key: self.image2image_loss(task_dict)}
+        # ---------------- 精准修改：展开详细字典 ----------------
+        base_key = 'loss_visual' if task == 'visual' else 'loss_segmentation'
+        
+        # 获取包含详细分类的字典
+        losses = self.image2image_loss(task_dict, soar_lambda=1.0, pixel_lambda=1.0, return_dict=True)
+        
+        # 组装返回，带有 _log 后缀的键只做监控，不能做 backward
+        loss_dict = {
+            base_key: losses['loss'],                              # e.g., 'loss_visual' (主梯度)
+            f"{base_key}_diff_log": losses['loss_diff_log'],       # e.g., 'loss_visual_diff_log'
+            f"{base_key}_soar_log": losses['loss_soar_log'],       # e.g., 'loss_visual_soar_log'
+            f"{base_key}_pixel_log": losses['loss_pixel_log']      # e.g., 'loss_visual_pixel_log'
+        }
         return loss_dict
     
+
+    # ── Diffusion loss ────────────────────────────────────────────────
+    def get_sigmas(self, timesteps, n_dim=4):
+        sigmas = self.train_scheduler.sigmas.to(device=self.device, dtype=self.dtype)
+        schedule_timesteps = self.train_scheduler.timesteps.to(self.device)
+        timesteps = timesteps.to(self.device)
+
+        matches      = (schedule_timesteps.unsqueeze(0) == timesteps.unsqueeze(1))
+        step_indices = matches.long().argmax(dim=1)
+
+        sigma = sigmas[step_indices].flatten()
+        while sigma.ndim < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    # ── 解耦模块 1: 基础 Flow Matching 损失 ───────────────────────────
+    def compute_diff_loss(self, model_input, pooled_prompt_embeds, prompt_embeds, cond_input=None, return_internal=False):
+        model_input = model_input.to(self.device, dtype=self.dtype)
+        noise = torch.randn_like(model_input)
+        bsz = model_input.shape[0]
+
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme=self.weighting_scheme, batch_size=bsz,
+            logit_mean=self.logit_mean, logit_std=self.logit_std)
+
+        if self.train_scheduler.config.use_dynamic_shifting:
+            seq_len = (model_input.shape[-2] * model_input.shape[-1]) // (self.transformer.config.patch_size ** 2)
+            image_seq_lens = torch.full((bsz,), seq_len, dtype=self.dtype, device=self.device)
+            mu = calculate_shift(
+                image_seq_lens,
+                self.train_scheduler.config.get("base_image_seq_len", 256),
+                self.train_scheduler.config.get("max_image_seq_len", 4096),
+                self.train_scheduler.config.get("base_shift", 0.5),
+                self.train_scheduler.config.get("max_shift", 1.15))
+            shift = torch.exp(mu) if self.train_scheduler.config.time_shift_type == "exponential" else mu
+            sigmas = u.to(dtype=self.dtype, device=self.device)
+            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+            timesteps = sigmas * self.train_scheduler.config.num_train_timesteps
+            sigmas = sigmas.view(-1, 1, 1, 1)
+        else:
+            indices = (u * self.train_scheduler.config.num_train_timesteps).long()
+            indices = torch.clamp(indices, 0, self.train_scheduler.config.num_train_timesteps - 1)
+            timesteps = self.train_scheduler.timesteps[indices].to(device=self.device)
+            sigmas = self.train_scheduler.sigmas[indices].to(device=self.device, dtype=self.dtype).view(-1, 1, 1, 1)
+
+        noisy_input = (1.0 - sigmas.float()) * model_input.float() + sigmas.float() * noise.float()
+        noisy_input = noisy_input.to(dtype=self.dtype)
+
+        model_pred = self.transformer(
+            hidden_states=noisy_input, cond_hidden_states=cond_input, 
+            encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds,
+            timestep=timesteps, return_dict=False)[0]
+        
+        weighting = compute_loss_weighting_for_sd3(weighting_scheme=self.weighting_scheme, sigmas=sigmas)
+        target = noise - model_input
+        batch_loss_base = (weighting * (model_pred - target) ** 2).view(bsz, -1).mean(dim=1)
+
+        if return_internal:
+            # 返回基础loss，以及共享的计算图组件给其他loss使用
+            return batch_loss_base, model_pred, noisy_input, sigmas, noise, timesteps
+        
+        return batch_loss_base
+
+    # ── 解耦模块 2: SOAR 自我纠正损失 ───────────────────────────────
+    def compute_soar_loss(self, model_input, noisy_input, model_pred, sigmas, noise, timesteps,
+                          pooled_prompt_embeds, prompt_embeds, 
+                          uncond_pooled_embeds, uncond_prompt_embeds, # 接收真实的无条件特征
+                          cond_input=None, soar_cfg_scale=4.5, soar_N=1):
+        bsz = model_input.shape[0]
+        loss_corr_sum = 0.0
+        
+        with torch.no_grad():            
+            v_uncond = self.transformer(
+                hidden_states=noisy_input, 
+                cond_hidden_states=cond_input,
+                encoder_hidden_states=uncond_prompt_embeds, 
+                pooled_projections=uncond_pooled_embeds,
+                timestep=timesteps, 
+                return_dict=False)[0]
+            
+            v_cfg = v_uncond + soar_cfg_scale * (model_pred.detach() - v_uncond)
+            step_size = 1.0 / getattr(self.train_scheduler.config, 'num_train_timesteps', 1000)
+            sigmas_t1 = torch.clamp(sigmas - step_size, min=0.0)
+            z_hat_t1 = noisy_input + (sigmas_t1.float() - sigmas.float()) * v_cfg.float()
+            z_hat_t1 = z_hat_t1.to(dtype=self.dtype)
+
+        for _ in range(soar_N):
+            alpha = torch.rand((bsz, 1, 1, 1), device=self.device, dtype=self.dtype)
+            sigmas_t_prime = (1.0 - alpha) * sigmas_t1 + alpha * 1.0
+            z_sigma_t_prime = (1.0 - alpha) * z_hat_t1 + alpha * noise
+            timesteps_t_prime = sigmas_t_prime.view(-1) * self.train_scheduler.config.num_train_timesteps
+            
+            v_off = self.transformer(
+                hidden_states=z_sigma_t_prime.to(dtype=self.dtype), cond_hidden_states=cond_input,
+                encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds,
+                timestep=timesteps_t_prime.to(dtype=timesteps.dtype), return_dict=False)[0]
+            
+            v_corr = ((z_sigma_t_prime - model_input) / sigmas_t_prime).detach() 
+            weighting_aux = compute_loss_weighting_for_sd3(weighting_scheme=self.weighting_scheme, sigmas=sigmas_t_prime)
+            loss_corr_sum += (weighting_aux * (v_off - v_corr)**2).view(bsz, -1).mean(dim=1)
+            
+        return loss_corr_sum
+
+    # ── 解耦模块 3: 像素空间结构损失 (单步重建) ───────────────────────
+    def compute_pixel_loss(self, noisy_input, model_pred, sigmas, target_pixels, lpips_weight=1.0):
+        bsz = noisy_input.shape[0]
+        pixel_loss = torch.zeros(bsz, device=self.device, dtype=self.dtype)
+        
+        # 仅在低噪声阶段 (sigma < 0.5) 触发，防止高噪声时的随机性破坏训练
+        valid_mask = sigmas.flatten() < 0.5 # 确保 mask 形状对齐 [B]
+        
+        if valid_mask.any():
+            # 基于训练过程的单步重建 (Single-step Reconstruction) 反演 z_0
+            pred_z0 = noisy_input[valid_mask] - sigmas[valid_mask].float() * model_pred[valid_mask]
+            pred_z0 = pred_z0.to(dtype=self.dtype)
+            pred_pixels = self.batch_latents_to_pixels(pred_z0)
+            
+            targets = target_pixels[valid_mask].to(self.device, dtype=self.dtype)
+            
+            l1_loss = F.l1_loss(pred_pixels, targets, reduction='none').mean(dim=[1, 2, 3])
+            
+            # 图像梯度计算 (提取边缘结构)
+            grad_x_pred = pred_pixels[..., 1:] - pred_pixels[..., :-1]
+            grad_y_pred = pred_pixels[..., 1:, :] - pred_pixels[..., :-1, :]
+            grad_x_tgt = targets[..., 1:] - targets[..., :-1]
+            grad_y_tgt = targets[..., 1:, :] - targets[..., :-1, :]
+            
+            grad_loss_x = F.l1_loss(grad_x_pred, grad_x_tgt, reduction='none').mean(dim=[1, 2, 3])
+            grad_loss_y = F.l1_loss(grad_y_pred, grad_y_tgt, reduction='none').mean(dim=[1, 2, 3])
+            
+            # --- 新增 LPIPS 计算 ---
+            if lpips_weight > 0:
+                # lpips 返回 shape 为 [B_valid, 1, 1, 1]，通过 view(-1) 展平为 [B_valid]
+                loss_lpips = self.lpips_model(pred_pixels, targets).view(-1)
+            else:
+                loss_lpips = 0.0
+            
+            # 融合重建损失与感知损失
+            pixel_loss[valid_mask] = 0.5 * l1_loss + 0.5 * (grad_loss_x + grad_loss_y) + lpips_weight * loss_lpips
+
+        return pixel_loss
+
+    # ──── loss debug ───────────────────────────────────────────────
+    def _debug_loss_check(self, mean_loss, weighting, model_pred, target, model_input, sigmas, batch_loss):
+        """将原来巨大的 print 块抽离为一个辅助方法，保持代码整洁"""
+        if mean_loss.item() > 3.0:
+            print("\n" + "="*50)
+            print(f"💥 [DEBUG] Loss 爆炸拦截: {mean_loss.item():.4f}")
+            print(f"--- 权重加成 (weighting) Max: {weighting.max().item():.4f}, Min: {weighting.min().item():.4f}")
+            print(f"--- 预测值 (model_pred) Max: {model_pred.max().item():.4f}, Min: {model_pred.min().item():.4f}")
+            print(f"--- 真实值 (target) Max: {target.max().item():.4f}, Min: {target.min().item():.4f}")
+            print(f"--- 模型输入 (model_input) Max: {model_input.max().item():.4f}, Min: {model_input.min().item():.4f}")
+            print(f"--- 时间步 (sigmas) Max: {sigmas.max().item():.4f}, Min: {sigmas.min().item():.4f}")
+            
+            bad_idx = torch.argmax(batch_loss).item()
+            print(f"--- 爆炸的样本索引: {bad_idx}")
+            print("="*50 + "\n")
+
+
     # ── Generation ───────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -641,6 +926,7 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
                  cfg_prompt,
                  pixel_values_src=None,
                  cfg_scale=4.5,
+                 c2fg_lambda=1.0,  # [精准修改] 新增 C2FG 的核心控制参数
                  num_steps=50,
                  generator=None,
                  height=512,
@@ -657,7 +943,6 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             ]
             all_src = [img for refs in pixel_values_src for img in refs] #[B*n, C, H, W]
             image_embeds, image_grid_thw = self.get_semantic_features_dynamic(all_src)
-            # ref_lens = [len(x) for x in image_embeds]
             ref_lens = []
             ptr = 0
             for n in num_refs:
@@ -684,10 +969,27 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
 
         pipeline = self._get_pipeline()
         pipeline.set_progress_bar_config(disable=not progress_bar)
+        
+        # [精准修改] C2FG 动态回调逻辑
+        callback_on_step_end = None
+        if c2fg_lambda is not None and c2fg_lambda > 0:
+            omega_0 = cfg_scale
+            def dynamic_cfg_callback(pipe, step_index, timestep, callback_kwargs):
+                # 计算进度 0.0 -> 1.0 (对应论文中的 1 - t/t_max)
+                progress = step_index / max(1, (num_steps - 1))
+                
+                # C2FG 核心公式: w(t) = w0 * exp(lambda * progress)
+                current_omega = omega_0 * math.exp(c2fg_lambda * progress)
+                
+                # 动态覆盖 Pipeline 内部的 guidance_scale
+                pipe._guidance_scale = current_omega 
+                return callback_kwargs
+            
+            callback_on_step_end = dynamic_cfg_callback
 
         samples = pipeline(
             height=height, width=width,
-            guidance_scale=cfg_scale,
+            guidance_scale=cfg_scale, # 作为初始 w0 传入，将在回调中被动态覆盖
             num_inference_steps=num_steps,
             prompt_embeds=seq_out[:b],
             pooled_prompt_embeds=pooled_out[:b],
@@ -696,196 +998,10 @@ class Qwen2p5VLStableDiffusion3HF(nn.Module):
             generator=generator,
             output_type='latent',
             cond_latents=cond_latents,
+            callback_on_step_end=callback_on_step_end, # [精准修改] 挂载回调
         ).images.to(self.dtype)
         
         # 返回前转换为像素
-        return self.batch_latents_to_pixels(samples)
-
-    # ── Diffusion loss ────────────────────────────────────────────────
-    def get_sigmas(self, timesteps, n_dim=4):
-        sigmas = self.train_scheduler.sigmas.to(device=self.device, dtype=self.dtype)
-        schedule_timesteps = self.train_scheduler.timesteps.to(self.device)
-        timesteps = timesteps.to(self.device)
-
-        matches      = (schedule_timesteps.unsqueeze(0) == timesteps.unsqueeze(1))
-        step_indices = matches.long().argmax(dim=1)
-
-        sigma = sigmas[step_indices].flatten()
-        while sigma.ndim < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
-
-   def diff_loss(self, model_input, pooled_prompt_embeds, prompt_embeds, cond_input=None, 
-                  use_soar=True, soar_cfg_scale=4.5, soar_N=1, soar_lambda=1.0):
-        """
-        集成了 SOAR (Self-Correction for Optimal Alignment and Refinement) 的 Diffusion Loss。
-        参数:
-            use_soar (bool): 是否启用 SOAR 轨迹纠正。
-            soar_cfg_scale (float): 构造偏离轨迹时的 CFG 权重 (论文默认为 4.5)。
-            soar_N (int): 每个样本采样的辅助纠正点数量 (论文默认为 1)。
-            soar_lambda (float): 纠正 Loss 的权重占比。
-        """
-        model_input = model_input.to(self.device, dtype=self.dtype)
-        noise = torch.randn_like(model_input) # 这里就是论文中的 z_1
-        bsz = model_input.shape[0]
-
-        u = compute_density_for_timestep_sampling(
-            weighting_scheme=self.weighting_scheme,
-            batch_size=bsz,
-            logit_mean=self.logit_mean,
-            logit_std=self.logit_std)
-
-        if self.train_scheduler.config.use_dynamic_shifting:
-            assert self.weighting_scheme == 'logit_normal'
-            seq_len = (model_input.shape[-2] * model_input.shape[-1]) // (self.transformer.config.patch_size ** 2)
-            image_seq_lens = torch.full((bsz,), seq_len, dtype=self.dtype, device=self.device)
-            
-            mu = calculate_shift(
-                image_seq_lens,
-                self.train_scheduler.config.get("base_image_seq_len", 256),
-                self.train_scheduler.config.get("max_image_seq_len", 4096),
-                self.train_scheduler.config.get("base_shift", 0.5),
-                self.train_scheduler.config.get("max_shift", 1.15))
-
-            shift_type = self.train_scheduler.config.time_shift_type
-            if shift_type == "exponential":
-                shift = torch.exp(mu)
-            elif shift_type == "linear":
-                shift = mu
-            else:
-                raise NotImplementedError(f"Unknown shift type: {shift_type}")
-
-            sigmas = u.to(dtype=self.dtype, device=self.device)
-            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-            timesteps = sigmas * self.train_scheduler.num_train_timesteps
-            sigmas = sigmas.view(-1, 1, 1, 1)
-        else:
-            indices = (u * self.train_scheduler.config.num_train_timesteps).long()
-            indices = torch.clamp(indices, 0, self.train_scheduler.config.num_train_timesteps - 1)
-            timesteps = self.train_scheduler.timesteps[indices].to(device=self.device)
-            sigmas = self.train_scheduler.sigmas[indices].to(device=self.device, dtype=self.dtype)
-            sigmas = sigmas.view(-1, 1, 1, 1)
-
-        # z_t0: 当前时刻的理想加噪状态
-        noisy_input = (1.0 - sigmas.float()) * model_input.float() + sigmas.float() * noise.float()
-        noisy_input = noisy_input.to(dtype=self.dtype)
-
-        # -------------------------------------------------------------
-        # 1. On-trajectory Forward Pass (基础 Flow Matching 损失)
-        # -------------------------------------------------------------
-        model_pred = self.transformer(
-            hidden_states=noisy_input,
-            cond_hidden_states=cond_input, 
-            encoder_hidden_states=prompt_embeds,
-            pooled_projections=pooled_prompt_embeds,
-            timestep=timesteps,
-            return_dict=False,
-        )[0]
-        
-        weighting = compute_loss_weighting_for_sd3(
-            weighting_scheme=self.weighting_scheme, sigmas=sigmas)
-
-        target = noise - model_input
-        loss_base = (weighting * (model_pred - target) ** 2)
-        batch_loss_base = loss_base.view(bsz, -1).mean(dim=1)
-        
-        # 如果不启用 SOAR，直接返回原版 Loss
-        if not use_soar:
-            mean_loss = batch_loss_base.mean()
-            self._debug_loss_check(mean_loss, weighting, model_pred, target, model_input, sigmas, batch_loss_base)
-            return mean_loss
-
-        # -------------------------------------------------------------
-        # 2. SOAR: Self-Correction 逻辑
-        # -------------------------------------------------------------
-        # 步骤A: 构造偏离轨迹的状态 (Off-trajectory State Construction)
         with torch.no_grad():
-            # 获取无条件特征 (Unconditional Embeddings) 用于 CFG
-            # 这里的 zero 掩码是一种高效的无条件近似。若需极度精确，可传入真正的 [""] 文本特征
-            uncond_prompt_embeds = torch.zeros_like(prompt_embeds)
-            uncond_pooled_embeds = torch.zeros_like(pooled_prompt_embeds)
-            
-            v_uncond = self.transformer(
-                hidden_states=noisy_input,
-                cond_hidden_states=cond_input,
-                encoder_hidden_states=uncond_prompt_embeds,
-                pooled_projections=uncond_pooled_embeds,
-                timestep=timesteps,
-                return_dict=False,
-            )[0]
-            
-            # 计算 CFG 速度 (Stop-Gradient)
-            # v_cfg = sg[ v_uncond + w_cfg * (v_cond - v_uncond) ]
-            v_cfg = v_uncond + soar_cfg_scale * (model_pred.detach() - v_uncond)
-            
-            # 单步欧拉推断：计算 t1 = max(t0 - 1/K, 0)
-            K = getattr(self.train_scheduler.config, 'num_train_timesteps', 1000)
-            step_size = 1.0 / K
-            sigmas_t1 = torch.clamp(sigmas - step_size, min=0.0)
-            
-            # 计算偏离状态: z_hat_t1 = z_t0 + (t1 - t0) * v_cfg
-            z_hat_t1 = noisy_input + (sigmas_t1.float() - sigmas.float()) * v_cfg.float()
-            z_hat_t1 = z_hat_t1.to(dtype=self.dtype)
-
-        # 步骤B: 对辅助点进行同源重加噪和纠正 (Re-noising & Correction)
-        loss_corr_sum = 0.0
-        
-        for n in range(soar_N):
-            # 采样 alpha ~ Uniform[0, 1]
-            alpha = torch.rand((bsz, 1, 1, 1), device=self.device, dtype=self.dtype)
-            
-            # 计算辅助噪声级: sigma_t' = (1 - alpha) * sigma_t1 + alpha * 1.0
-            sigmas_t_prime = (1.0 - alpha) * sigmas_t1 + alpha * 1.0
-            
-            # 重点：使用同样的 z_1 (noise) 进行重加噪，确保锚点依然是 z_0
-            # z_sigma_t' = (1 - alpha) * z_hat_t1 + alpha * noise
-            z_sigma_t_prime = (1.0 - alpha) * z_hat_t1 + alpha * noise
-            
-            # 重新计算此时的 Timesteps
-            timesteps_t_prime = sigmas_t_prime.view(-1) * self.train_scheduler.num_train_timesteps
-            
-            # 预测 off-trajectory 下的速度
-            v_off = self.transformer(
-                hidden_states=z_sigma_t_prime.to(dtype=self.dtype),
-                cond_hidden_states=cond_input,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt_embeds,
-                timestep=timesteps_t_prime.to(dtype=timesteps.dtype),
-                return_dict=False,
-            )[0]
-            
-            # 解析推导的纠正目标: v_corr = (z_sigma_t' - z_0) / sigma_t'
-            v_corr = (z_sigma_t_prime - model_input) / sigmas_t_prime
-            
-            # 计算该时刻的损失权重
-            weighting_aux = compute_loss_weighting_for_sd3(
-                weighting_scheme=self.weighting_scheme, sigmas=sigmas_t_prime)
-                
-            loss_corr_n = (weighting_aux * (v_off - v_corr)**2).view(bsz, -1).mean(dim=1)
-            loss_corr_sum += loss_corr_n
-            
-        # -------------------------------------------------------------
-        # 3. 聚合总损失 (Loss Aggregation)
-        # -------------------------------------------------------------
-        # L_SOAR = (L_base + lambda * sum(L_corr)) / (1 + lambda * N)
-        batch_loss_soar = (batch_loss_base + soar_lambda * loss_corr_sum) / (1.0 + soar_lambda * soar_N)
-        mean_loss = batch_loss_soar.mean()
-
-        self._debug_loss_check(mean_loss, weighting, model_pred, target, model_input, sigmas, batch_loss_base)
-            
-        return mean_loss
-
-    def _debug_loss_check(self, mean_loss, weighting, model_pred, target, model_input, sigmas, batch_loss):
-        """将原来巨大的 print 块抽离为一个辅助方法，保持代码整洁"""
-        if mean_loss.item() > 3.0:
-            print("\n" + "="*50)
-            print(f"💥 [DEBUG] Loss 爆炸拦截: {mean_loss.item():.4f}")
-            print(f"--- 权重加成 (weighting) Max: {weighting.max().item():.4f}, Min: {weighting.min().item():.4f}")
-            print(f"--- 预测值 (model_pred) Max: {model_pred.max().item():.4f}, Min: {model_pred.min().item():.4f}")
-            print(f"--- 真实值 (target) Max: {target.max().item():.4f}, Min: {target.min().item():.4f}")
-            print(f"--- 模型输入 (model_input) Max: {model_input.max().item():.4f}, Min: {model_input.min().item():.4f}")
-            print(f"--- 时间步 (sigmas) Max: {sigmas.max().item():.4f}, Min: {sigmas.min().item():.4f}")
-            
-            bad_idx = torch.argmax(batch_loss).item()
-            print(f"--- 爆炸的样本索引: {bad_idx}")
-            print("="*50 + "\n")
+            res = self.batch_latents_to_pixels(samples)
+        return res

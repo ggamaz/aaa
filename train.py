@@ -19,7 +19,7 @@ from tqdm import tqdm
 import glob
 import shutil
 
-
+from omegaconf import OmegaConf
 from log_helper import log_training_images_dynamic as log_training_images
 from log_helper import print_log, init_logger, log_model_parameters, print_gpu_mem
 
@@ -51,70 +51,13 @@ class CPUOffloadedEMA:
     def get_state_dict(self):
         return {k: v.clone() for k, v in self.shadow_params.items()}
 
-
-SD3_PATH  = "pretrain_ckpts/UniPic2-SD3.5M-Kontext-2B"
-QWEN_PATH = "pretrain_ckpts/Qwen2.5-VL-3B-Instruct"
-
-PROMPT_TEMPLATE = dict(
-    IMG_START_TOKEN='<|vision_start|>',
-    IMG_END_TOKEN='<|vision_end|>',
-    IMG_CONTEXT_TOKEN='<|image_pad|>',
-    IMG_START_TOKEN_FOR_GENERATION=False,
-    SYSTEM='<|im_start|>system\n{system}<|im_end|>\n',
-    INSTRUCTION='<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n',
-    SUFFIX='<|im_end|>',
-    SUFFIX_AS_EOS=True,
-    SEP='\n',
-    STOP_WORDS=['<|im_end|>', '<|endoftext|>'],
-    GENERATION='Generate an image: {input}',
-    CFG="blurry, low quality, low resolution, distorted, deformed, broken content, missing parts, damaged details, artifacts, glitch, noise, pixelated, grainy, compression artifacts, bad composition, wrong proportion, incomplete editing, unfinished, unedited areas."
-)
-
-CONNECTOR_CFG = dict(
-    hidden_size=2048,
-    intermediate_size=11946,
-    num_hidden_layers=6,
-    _attn_implementation='flash_attention_2',
-    num_attention_heads=32,
-)
-
 def parse_args():
-    parser = argparse.ArgumentParser()
-    # data
-    parser.add_argument('--data_path',       type=str, default="COCO/fusion_and_seg_dataset_labeled.json")
-    parser.add_argument('--image_folder',    type=str, default="COCO")
-    parser.add_argument('--image_size',      type=int, default=512)
-    parser.add_argument('--image_length',    type=int, default=256)
-    parser.add_argument('--image_process',   type=str, default='fix_pixels', choices=['dynamic', 'fix_pixels', 'resize2square'])
-    
-    parser.add_argument('--output_dir',      type=str, default="./runs/output")
-    parser.add_argument('--resume',          type=str, default=None, help="Path to a checkpoint to resume")
-    parser.add_argument('--max_steps',       type=int, default=3000)
-    parser.add_argument('--batch_size',      type=int, default=12)
-    parser.add_argument('--grad_accum',      type=int, default=1)
-    #train no_ema,no_log_img bs-accum:t-m  1-1: 3h-24G, 1-4: 15h-24G, 4-1: 6h-25G
-    parser.add_argument('--lr',              type=float, default=2e-5)
-    parser.add_argument('--lr_scheduler',    type=str, default='cosine')
-    parser.add_argument('--warmup_steps',    type=int, default=250)
-    parser.add_argument('--max_grad_norm',   type=float, default=1.0)
-    parser.add_argument('--save_every',      type=int, default=100)
-    parser.add_argument('--log_every',       type=int, default=1)
-    parser.add_argument('--log_image_every', type=int, default=10)
-    parser.add_argument('--num_workers',     type=int, default=16) 
-    parser.add_argument('--seed',            type=int, default=42)
-    
-    # model
-    parser.add_argument('--num_queries',     type=int, default=128)
-    parser.add_argument('--max_length',      type=int, default=1024)
-    parser.add_argument('--freeze_lmm',      action='store_true', default=True)
-    parser.add_argument('--llm_lora_modules', type=str, default="auto")
-    parser.add_argument('--freeze_transformer', action='store_true', default=True)
-    parser.add_argument('--dit_lora_config', type=str, default=dict(r=64, lora_alpha=128))
-    parser.add_argument('--freeze_meta_query', action='store_true', default=True)
-    parser.add_argument('--use_activation_checkpointing', action='store_true', default=True)
-    
-    # args compatibility
-    parser.add_argument('--local_rank',      type=int, default=-1)
+    # 仅保留最基础的引导参数
+    parser = argparse.ArgumentParser(description="Training script with OmegaConf")
+    parser.add_argument('--config', type=str, default='config/cfg.yaml', help='path to config file')
+    # 允许接收剩余的命令行参数作为覆盖项
+    parser.add_argument('opts', default=None, nargs=argparse.REMAINDER, 
+                        help="Modify config options using the command-line")
     return parser.parse_args()
 
 def collate_fn(batch):
@@ -129,20 +72,36 @@ def collate_fn(batch):
     return collated
 
 def main():
-    args = parse_args()
+    cli_args = parse_args()
+    conf = OmegaConf.load(cli_args.config)
+    
+    # 合并命令行覆盖项 (例如 python train.py train.lr=1e-4)
+    if cli_args.opts:
+        cli_conf = OmegaConf.from_dotlist(cli_args.opts)
+        conf = OmegaConf.merge(conf, cli_conf)
+    
+    # 为了保持后续代码 args.xxx 调用习惯，将 conf 重命名为 args
+    args = conf
     
     # ── 1. 初始化 Accelerate ───────────────────────────────────────────
     project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=os.path.join(args.output_dir, "logs"))
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.grad_accum,
-        mixed_precision="bf16",
+        gradient_accumulation_steps=args.train.grad_accum,
+        mixed_precision=args.train.precision,
         log_with="tensorboard",
         project_config=project_config
     )
-    set_seed(args.seed)
+    set_seed(args.train.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
     init_logger(args.output_dir, is_main_process=accelerator.is_main_process)
+    
+    # ================= 新增：自动保存完整配置快照 =================
+    if accelerator.is_main_process:
+        save_cfg_path = os.path.join(args.output_dir, "run_config.yaml")
+        OmegaConf.save(config=args, f=save_cfg_path)
+        print_log(f"Saved full experiment configuration to {save_cfg_path}")
+    # ==============================================================
     
     if accelerator.is_main_process:
         print_log("=" * 60)
@@ -154,24 +113,24 @@ def main():
 
     # ── 2. 加载模型与数据 ──────────────────────────────────────────────
     print_log("Loading tokenizer & dataset...")
-    tokenizer = AutoTokenizer.from_pretrained(QWEN_PATH, trust_remote_code=True, padding_side='left')
+    tokenizer = AutoTokenizer.from_pretrained(args.qwen_path, trust_remote_code=True, padding_side='left')
 
     dataset = MyDataset(
-        data_path=args.data_path,
-        image_folder=args.image_folder,
+        data_path=args.data.data_path,
+        image_folder=args.data.image_folder,
         tokenizer=tokenizer,
-        prompt_template=PROMPT_TEMPLATE,
-        image_size=args.image_size,
-        image_length=args.image_length,
-        image_process=args.image_process,
-        max_length=args.max_length,
+        prompt_template=args.prompt_template,
+        image_size=args.data.image_size,
+        image_length=args.data.image_length,
+        image_process=args.data.image_process,
+        max_length=args.model.max_length,
     )
 
     loader = DataLoader(
         dataset, 
-        batch_size=args.batch_size,
+        batch_size=args.data.batch_size,
         shuffle=True, 
-        num_workers=args.num_workers,
+        num_workers=args.data.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
         persistent_workers=True,
@@ -179,11 +138,11 @@ def main():
     )
 
     print_log("Loading Base Models (LMM, Transformer, VAE)...")
-    lmm = Qwen2_5_VLForConditionalGeneration.from_pretrained(QWEN_PATH, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-    transformer = SD3Transformer2DModel.from_pretrained(SD3_PATH, subfolder="transformer", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(SD3_PATH, subfolder="scheduler")
+    lmm = Qwen2_5_VLForConditionalGeneration.from_pretrained(args.qwen_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+    transformer = SD3Transformer2DModel.from_pretrained(args.sd3_path, subfolder="transformer", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.sd3_path, subfolder="scheduler")
     test_scheduler = deepcopy(scheduler)
-    vae = AutoencoderKL.from_pretrained(SD3_PATH, subfolder="vae", torch_dtype=torch.bfloat16)
+    vae = AutoencoderKL.from_pretrained(args.sd3_path, subfolder="vae", torch_dtype=torch.bfloat16)
     vae.enable_slicing()
     vae.enable_tiling()
     
@@ -195,30 +154,32 @@ def main():
         vae=vae,
         lmm=lmm,
         tokenizer=tokenizer,
-        prompt_template=PROMPT_TEMPLATE,
-        connector=CONNECTOR_CFG,
-        num_queries=args.num_queries,
-        max_length=args.max_length,
-        freeze_lmm=args.freeze_lmm,
-        lora_modules=args.llm_lora_modules,
-        freeze_transformer=args.freeze_transformer,
-        dit_lora_config=args.dit_lora_config,
-        freeze_mq=args.freeze_meta_query,
-        use_activation_checkpointing=args.use_activation_checkpointing,
-        pretrained_pth="pretrain_ckpts/merged_model.pt",
-        # pretrained_pth="pretrain_ckpts/model.pt",
+        prompt_template=args.prompt_template,
+        connector=args.connector_cfg,
+        num_queries=args.model.num_queries,
+        max_length=args.model.max_length,
+        # model config
+        freeze_lmm=args.model.freeze_lmm,
+        lora_modules=args.model.llm_lora_modules,
+        freeze_transformer=args.model.freeze_transformer,
+        dit_lora_config=args.model.dit_lora_config,
+        freeze_mq=args.model.freeze_meta_query,
+        freeze_connector=args.model.freeze_connector,
+        # training config
+        use_activation_checkpointing=args.model.use_activation_checkpointing,
+        pretrained_pth="ckpts/merged_model.pt",
         weighting_scheme='None',
     )
     # torch.save(model.state_dict(), "temp_merged.pth") # 临时保存一次合并后的权重，方便后续分析
     # raise ValueError("Debugging checkpoint loading - stop here to analyze temp_merged.pth")
     
     trainable_params = log_model_parameters(model, is_main_process=accelerator.is_main_process)
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.train.lr, weight_decay=1e-2)
     lr_scheduler = get_scheduler(
-        name=args.lr_scheduler,
+        name=args.train.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.max_steps,
+        num_warmup_steps=args.train.warmup_steps,
+        num_training_steps=args.train.max_steps,
     )
 
     # ── 3. Accelerate 接管 ─────────────────────────────────────────────
@@ -275,8 +236,8 @@ def main():
             return
     
     model.train()
-    with tqdm(total=args.max_steps, initial=start_step, disable=not accelerator.is_local_main_process) as pbar:
-        while global_step < args.max_steps:
+    with tqdm(total=args.train.max_steps, initial=start_step, disable=not accelerator.is_local_main_process) as pbar:
+        while global_step < args.train.max_steps:
             try:
                 batch = next(loader_iter)
             except StopIteration:
@@ -286,14 +247,15 @@ def main():
 
             with accelerator.accumulate(model):
                 losses = model(batch, mode='loss', curr_step=global_step)
-                loss = sum(losses.values()) 
+                # 只对不包含 '_log' 的主键进行梯度求和，防止重复反向传播
+                loss = sum(v for k, v in losses.items() if not k.endswith('_log'))
                 
                 accelerator.backward(loss)
                 running_loss_sum += loss.item()
                 running_steps += 1
                 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(trainable_params, args.train.max_grad_norm)
                     optimizer.step()
                     
                     unwrapped_model = accelerator.unwrap_model(model)
@@ -308,8 +270,15 @@ def main():
                     
                     pbar.update(1)
 
-                    if global_step % args.log_every == 0 and accelerator.is_main_process:
-                        loss_str = '  '.join(f'{k}: {v.item():.4f}' for k, v in losses.items())
+                    if global_step % args.train.log_every == 0 and accelerator.is_main_process:
+                        main_loss_str = '  '
+                        all_loss_str = '  '
+                        for k, v in losses.items():
+                            v = v.item() if isinstance(v, torch.Tensor) else v
+                            all_loss_str += f"{k}: {v} "
+                            if not k.endswith('_log'):
+                                main_loss_str += f"{k}: {v} "
+
                         current_lr = lr_scheduler.get_last_lr()[0]
                         # 获取当前 GPU 的显存预留量 (转换为 GB)
                         if torch.cuda.is_available():
@@ -317,18 +286,19 @@ def main():
                             mem_str = f"Mem: {mem_gb:.1f}G"
                         else:
                             mem_str = "Mem: N/A"
-                        pbar.set_description(f"lr: {current_lr:.2e} | {mem_str} | {loss_str}")
-                        print_log(f"Step {global_step}: {loss_str} | LR: {current_lr:.2e} | {mem_str}", show_in_console=False)
+                            
+                        pbar.set_description(f"lr: {current_lr:.2e} | {mem_str} | {main_loss_str}")
+                        print_log(f"Step {global_step}: {all_loss_str} | LR: {current_lr:.2e} | {mem_str}", show_in_console=False)
                         
                         accelerator.log({
                             "train/lr": current_lr,
-                            "train/total_loss": loss.item() * args.grad_accum,
+                            "train/total_loss": loss.item() * args.train.grad_accum,
                             **{f"train/{k}": v.item() for k, v in losses.items()}
                         }, step=global_step)
 
                     # 取消注释，打开log_image 
-                    if global_step % args.log_image_every == 0 and accelerator.is_main_process:
-                        print_log(f"Logging training images at step {global_step}...")
+                    if global_step % args.train.log_image_every == 0 and accelerator.is_main_process:
+                        # print_log(f"Logging training images at step {global_step}...")
                         try:
                             mini_batch = {}
                             for k, v in batch.items():
@@ -340,7 +310,7 @@ def main():
                         except Exception as e:
                             print_log(f"Logging images failed: {e}", level="error")
 
-                    if global_step % args.save_every == 0:
+                    if global_step % args.train.save_every == 0:
                         accelerator.wait_for_everyone()
                         
                         # 1. 保存最新的 Accelerate 训练状态
@@ -412,7 +382,7 @@ def main():
         # final_ema_path = os.path.join(args.output_dir, "final_ema.pth")
         # torch.save(cpu_ema.get_state_dict(), final_ema_path)
         
-        print_log(f"Training complete. Final models saved.")
+        print_log("Training complete. Final models saved.")
         accelerator.end_training()
 
 if __name__ == '__main__':

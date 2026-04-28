@@ -1,0 +1,68 @@
+# 路径配置
+sd3_path: "ckpts/UniPic2-SD3.5M-Kontext-2B"
+qwen_path: "ckpts/Qwen2.5-VL-3B-Instruct"
+output_dir: "./runs/output"
+resume: None
+
+# 数据配置
+data:
+  data_path: "COCO/fusion_and_seg_dataset_labeled.json"
+  image_folder: "COCO"
+  image_size: 512
+  image_length: 256
+  image_process: "fix_pixels"
+  num_workers: 64
+  batch_size: 8
+
+# 训练超参数
+train:
+  max_steps: 4000
+  grad_accum: 1
+  lr: 5.0e-5
+  lr_scheduler: "cosine"
+  warmup_steps: 250
+  max_grad_norm: 1.0
+  save_every: 100
+  log_every: 1
+  log_image_every: 10
+  seed: 42
+  precision: "bf16"
+
+# 模型架构与冻结逻辑
+model:
+  num_queries: 128
+  max_length: 768
+  freeze_lmm: true
+  llm_lora_modules: "auto"
+  freeze_meta_query: false
+  freeze_connector: false
+  freeze_transformer: true
+  dit_lora_config:
+    r: 64
+    lora_alpha: 128
+    target_modules: "all-linear"
+  use_activation_checkpointing: true
+
+# 提示词模板 (嵌套结构)
+prompt_template:
+  IMG_START_TOKEN: '<|vision_start|>'
+  IMG_END_TOKEN: '<|vision_end|>'
+  IMG_CONTEXT_TOKEN: '<|image_pad|>'
+  IMG_START_TOKEN_FOR_GENERATION: false
+  SYSTEM: '<|im_start|>system\n{system}<|im_end|>\n'
+  INSTRUCTION: '<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n'
+  SUFFIX: '<|im_end|>'
+  SUFFIX_AS_EOS: true
+  SEP: '\n'
+  STOP_WORDS: ['<|im_end|>', '<|endoftext|>']
+  GENERATION: 'Generate an image: {input}'
+  CFG: 'Generate an image.'
+  # neg_CFG="blurry, low quality, low resolution, distorted, deformed, broken content, missing parts, damaged details, artifacts, glitch, noise, pixelated, grainy, compression artifacts, bad composition, wrong proportion"
+
+# Connector 细节配置
+connector_cfg:
+  hidden_size: 2048
+  intermediate_size: 11946
+  num_hidden_layers: 6
+  _attn_implementation: 'flash_attention_2'
+  num_attention_heads: 32

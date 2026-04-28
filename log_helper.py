@@ -175,6 +175,105 @@ def save_visualization_grid(
     final_img.save(save_path)
     # print(f"Saved visualization: {save_path}") # 可选：打印保存路径
 
+# --- 核心函数 1：排版与保存 ---
+def save_visualization_grid(
+    pil_refs, gen_imgs, sample_texts, sample_types, ref_w, ref_h, 
+    output_dir, step=None, sample_idx=None, 
+    gt_visual_pil=None, gt_mask_pil=None, show_gt=True, filename=None
+):
+    """
+    负责将生成的图像、参考图、文本和 GT 图像进行网格排版，并保存到本地。
+    支持可选的 GT 展示，方便在推理脚本中复用。
+    """
+    # 自动推断：如果没有提供 GT 图，则强制关闭 show_gt
+    if gt_visual_pil is None and gt_mask_pil is None:
+        show_gt = False
+        
+    # 辅助绘图函数：文本转图像
+    def draw_text_image(text_content, prefix="Prompt"):
+        img = Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        wrap_width = max(20, ref_w // 12) 
+        wrapped_text = "\n".join(textwrap.wrap(f"[{prefix}]\n{text_content}", width=wrap_width))
+        try:
+            font = ImageFont.load_default(size=18)
+        except TypeError:
+            font = ImageFont.load_default()
+        draw.text((20, 20), wrapped_text, fill=(0, 0, 0), font=font, spacing=8)
+        return img
+
+    # 辅助拼接函数：横向拼接一行
+    def concat_row(images_list):
+        total_width = sum(img.size[0] for img in images_list)
+        max_height = max(img.size[1] for img in images_list)
+        concat_img = Image.new('RGB', (total_width, max_height))
+        x_offset = 0
+        for img in images_list:
+            concat_img.paste(img, (x_offset, 0))
+            x_offset += img.size[0]
+        return concat_img
+
+    blank_img = Image.new('RGB', (ref_w, ref_h), color=(255, 255, 255))
+    
+    # 动态组装网格行
+    # 第一行：参考图。如果 show_gt 为 True 则需要 3 列对齐，否则只需 2 列
+    num_cols = 3 if show_gt else 2
+    first_row_imgs = list(pil_refs)
+    
+    # 填充或截断以匹配列数
+    if len(first_row_imgs) < num_cols:
+        first_row_imgs += [blank_img] * (num_cols - len(first_row_imgs))
+    else:
+        first_row_imgs = first_row_imgs[:num_cols]
+        
+    rows = [concat_row(first_row_imgs)]
+
+    # 后续行：遍历每个任务 (文本描述 | 模型生成图 | [可选 GT 图])
+    for p_type, p_text, g_img in zip(sample_types, sample_texts, gen_imgs):
+        display_type = str(p_type).capitalize() if p_type else "Unknown Task"
+        row_imgs = [draw_text_image(p_text, display_type), g_img]
+        
+        # 如果开启了 GT 展示，才加入第三列
+        if show_gt:
+            if p_type == 'visual' and gt_visual_pil is not None:
+                gt_img = gt_visual_pil
+            elif p_type in ('segmentation', 'downstream') and gt_mask_pil is not None:
+                gt_img = gt_mask_pil
+            else:
+                gt_img = blank_img
+            row_imgs.append(gt_img)
+            
+        rows.append(concat_row(row_imgs))
+        
+    # 纵向拼接所有行
+    total_height = sum(r.size[1] for r in rows)
+    max_width = max(r.size[0] for r in rows)
+    
+    final_img = Image.new('RGB', (max_width, total_height))
+    y_offset = 0
+    for r in rows:
+        final_img.paste(r, (0, y_offset))
+        y_offset += r.size[1]
+        
+    # 执行保存逻辑
+    if filename:
+        # 如果提供了自定义文件名 (用于推理阶段)
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, filename)
+    else:
+        # 默认使用 step 命名 (用于训练阶段)
+        sample_dir = os.path.join(output_dir, "samples")
+        os.makedirs(sample_dir, exist_ok=True)
+        s_val = step if step is not None else 0
+        if sample_idx is not None:
+            save_path = os.path.join(sample_dir, f"step_{s_val:06d}_{sample_idx:04d}.jpg")
+        else:
+            save_path = os.path.join(sample_dir, f"step_{s_val:06d}.jpg")
+            
+    final_img.save(save_path)
+    # print(f"Saved visualization: {save_path}") # 可选：打印保存路径
+
+
 @torch.no_grad()
 def log_training_images_dynamic(model, batch, step, output_dir):
     """
@@ -221,20 +320,20 @@ def log_training_images_dynamic(model, batch, step, output_dir):
                 width=ref_w,
                 progress_bar=False
             )
-
-        # 保存结果 (注意传入的文件名可能需要区分 batch 里的不同样本)
+ 
+        # 调整了参数顺序以匹配更新后的函数签名
         save_visualization_grid(
             pil_refs=pil_refs,
-            gt_visual_pil=gt_visual_pil,
-            gt_mask_pil=gt_mask_pil,
             gen_imgs=[tensor_to_pil(img) for img in gen_outs],
             sample_texts=texts,
             sample_types=prompt_types,
             ref_w=ref_w,
             ref_h=ref_h,
+            output_dir=output_dir,
             step=step,
-            sample_idx=i if BSZ > 1 else None, # 建议传入索引，防止覆盖
-            output_dir=output_dir
+            sample_idx=i if BSZ > 1 else None,
+            gt_visual_pil=gt_visual_pil,
+            gt_mask_pil=gt_mask_pil,
+            show_gt=True  # 训练脚本中默认开启
         )
-        
     model.train()

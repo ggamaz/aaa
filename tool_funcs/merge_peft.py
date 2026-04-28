@@ -8,10 +8,10 @@ from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from qwen2_5_sd3.transformer_sd3_dynamic import SD3Transformer2DModel
 from qwen2_5_sd3.qwen2_5_vl_sd3_hf_dynamic_fusion import Qwen2p5VLStableDiffusion3HF
 
-SD3_PATH  = "pretrain_ckpts/UniPic2-SD3.5M-Kontext-2B"
-QWEN_PATH = "pretrain_ckpts/Qwen2.5-VL-3B-Instruct"
-CHECKPOINT_PATH = "pretrain_ckpts/model.pt" # 你的带有 LoRA 权重的 checkpoint
-OUTPUT_PATH = "pretrain_ckpts/merged_model.pt"
+SD3_PATH  = "ckpts/UniPic2-SD3.5M-Kontext-2B"
+QWEN_PATH = "ckpts/Qwen2.5-VL-3B-Instruct"
+CHECKPOINT_PATH = "ckpts/model.pt" # 你的带有 LoRA 权重的 checkpoint
+OUTPUT_PATH = "ckpts/merged_model.pt"
 CONNECTOR_CFG = dict(
     hidden_size=2048,
     intermediate_size=11946,
